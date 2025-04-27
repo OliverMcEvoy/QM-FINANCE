@@ -634,28 +634,68 @@ with tab2:
 
 with tab3:
     st.header("General Market & Sector Trends")
-    # Fetch index data for S&P 500, Nasdaq, Dow
-    index_map = {"S&P 500": "^GSPC", "Nasdaq Composite": "^IXIC", "Dow Jones": "^DJI"}
-    # Use sidebar start date as chart start
+    # Define market indices and commodities for analysis
+    index_map = {
+        "S&P 500": "^GSPC",
+        "Nasdaq Composite": "^IXIC",
+        "Dow Jones": "^DJI",
+        "FTSE 100": "^FTSE",
+        "DAX": "^GDAXI",
+        "Semiconductor Index": "^SOX",
+        "Gold ETF (GLD)": "GLD",
+        "Silver ETF (SLV)": "SLV",
+    }
     chart_start = datetime.combine(start_date, datetime.min.time())
     chart_end = datetime.now()
-    trend_series = {}
-    for name, idx in index_map.items():
-        idx_data = get_stock_data(idx, chart_start, chart_end)
-        if idx_data is not None and "Close" in idx_data:
-            trend_series[name] = idx_data["Close"]
-    if trend_series:
-        df_trends = pd.DataFrame(trend_series)
-        st.line_chart(df_trends)
-        # Show performance metrics
-        st.subheader("Index Performance")
-        perf = {}
-        for name, series in trend_series.items():
-            ret = series.pct_change().dropna()
-            perf[name] = {
-                "Total Return (%)": f"{(series.iloc[-1]/series.iloc[0]-1)*100:.2f}",
-                "Annualized Vol (%)": f"{ret.std()*np.sqrt(252)*100:.2f}",
-            }
-        st.dataframe(pd.DataFrame(perf).T)
-    else:
-        st.write("Market index data unavailable.")
+
+    # Loop through each market series and apply eigenvalue analysis
+    for name, ticker in index_map.items():
+        data = get_stock_data(ticker, chart_start, chart_end)
+        if data is not None and "Close" in data and not data["Close"].empty:
+            # Initialize analyzer with user-selected eigenvalue count
+            analyzer = EigenvalueAnalyzer(params={"eigenvalue_count": eigenvalue_count})
+            analysis = analyzer.analyze_stock(data)
+
+            if analysis and analysis.get("eigenvalue_history"):
+                fig, ax = plt.subplots(figsize=(12, 6))
+                # Plot price history
+                ax.plot(
+                    data.index,
+                    data["Close"],
+                    label="Close Price",
+                    color="#00BFFF",
+                    linewidth=2,
+                )
+
+                # Plot evolving eigenvalue levels
+                dates = analysis["dates"]
+                ev_history = analysis["eigenvalue_history"]
+                num_levels = len(ev_history[0])
+                colors = plt.cm.plasma(np.linspace(0, 1, num_levels))
+                for j in range(num_levels):
+                    series_j = [ev[j] for ev in ev_history]
+                    ax.plot(
+                        dates,
+                        series_j,
+                        "--",
+                        color=colors[j],
+                        alpha=0.8,
+                        linewidth=1.5,
+                        label=f"Level {j+1}",
+                    )
+
+                # Formatting
+                ax.set_title(
+                    f"{name} - Eigenvalue Analysis", color="white", fontsize=14
+                )
+                ax.xaxis.set_major_formatter(DateFormatter("%b %d %Y"))
+                plt.xticks(rotation=45)
+                ax.grid(True, linestyle="--", alpha=0.3)
+                legend = ax.legend(loc="upper left", framealpha=0.3)
+                plt.setp(legend.get_texts(), color="white")
+                plt.tight_layout()
+                st.pyplot(fig)
+            else:
+                st.write(f"No eigenvalue data available for {name}")
+        else:
+            st.write(f"Data unavailable for {name}")
