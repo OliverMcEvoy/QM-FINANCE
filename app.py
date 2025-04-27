@@ -7,9 +7,21 @@ import os
 import yfinance as yf
 from matplotlib.dates import DateFormatter
 import matplotlib as mpl
+import json
 
 from utils.stock_screener import StockScreener
 from utils.eigenvalue_analyzer import EigenvalueAnalyzer
+
+# Set default matplotlib style for all plots
+plt.style.use("dark_background")
+mpl.rcParams["axes.facecolor"] = "none"
+mpl.rcParams["figure.facecolor"] = "none"
+mpl.rcParams["text.color"] = "white"
+mpl.rcParams["axes.labelcolor"] = "white"
+mpl.rcParams["xtick.color"] = "white"
+mpl.rcParams["ytick.color"] = "white"
+mpl.rcParams["axes.edgecolor"] = "white"
+mpl.rcParams["grid.color"] = "#555555"
 
 # Default stocks list
 DEFAULT_TICKERS = [
@@ -25,16 +37,41 @@ DEFAULT_TICKERS = [
     "NFLX",
 ]
 
-# Set default matplotlib style for all plots
-plt.style.use("dark_background")
-mpl.rcParams["axes.facecolor"] = "none"
-mpl.rcParams["figure.facecolor"] = "none"
-mpl.rcParams["text.color"] = "white"
-mpl.rcParams["axes.labelcolor"] = "white"
-mpl.rcParams["xtick.color"] = "white"
-mpl.rcParams["ytick.color"] = "white"
-mpl.rcParams["axes.edgecolor"] = "white"
-mpl.rcParams["grid.color"] = "#555555"
+# File to store user's preferred ticker list
+SAVED_TICKERS_FILE = "data/saved_tickers.json"
+CACHE_DIR = "data/cache"
+
+# Ensure directories exist
+os.makedirs(os.path.dirname(SAVED_TICKERS_FILE), exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+# Function to load saved tickers
+def load_saved_tickers():
+    if os.path.exists(SAVED_TICKERS_FILE):
+        try:
+            with open(SAVED_TICKERS_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return DEFAULT_TICKERS
+    return DEFAULT_TICKERS
+
+
+# Function to save tickers
+def save_tickers(tickers):
+    with open(SAVED_TICKERS_FILE, "w") as f:
+        json.dump(tickers, f)
+
+
+# Function to clear cache
+def clear_cache():
+    count = 0
+    for file in os.listdir(CACHE_DIR):
+        if file.endswith(".pkl"):
+            os.remove(os.path.join(CACHE_DIR, file))
+            count += 1
+    return count
+
 
 # App configuration
 st.set_page_config(layout="wide", page_title="Eigenvalue Stock Screener")
@@ -59,22 +96,55 @@ st.title("Quantum Eigenvalue Stock Screener")
 # Sidebar controls
 st.sidebar.header("Screener Configuration")
 
+# Cache control section
+st.sidebar.subheader("Cache Control")
+if st.sidebar.button("Clear Cached Stock Data"):
+    files_removed = clear_cache()
+    st.sidebar.success(f"Cleared {files_removed} cached stock files")
+
+# User stock list management
+st.sidebar.subheader("Manage Your Stock List")
+saved_tickers = load_saved_tickers()
+
+# Show current saved list
+st.sidebar.write("Your Saved Stocks:")
+saved_tickers_text = st.sidebar.text_area(
+    "Edit your saved stock list (one ticker per line)",
+    "\n".join(saved_tickers),
+    height=150,
+)
+
+# Save button for ticker list
+if st.sidebar.button("Save Stock List"):
+    new_tickers = [
+        ticker.strip().upper()
+        for ticker in saved_tickers_text.split("\n")
+        if ticker.strip()
+    ]
+    save_tickers(new_tickers)
+    st.sidebar.success(f"Saved {len(new_tickers)} tickers to your list")
+    saved_tickers = new_tickers
+
+# Choose which ticker list to use
+st.sidebar.subheader("Select Ticker Source")
+ticker_source = st.sidebar.radio(
+    "Which stocks to analyze?", ["Saved Stock List", "Default Stocks", "Custom Input"]
+)
+
+custom_tickers_input = ""
+if ticker_source == "Custom Input":
+    custom_tickers_input = st.sidebar.text_area(
+        "Enter ticker symbols for this session only (one per line)", ""
+    )
+
 # Replace lookback days with date selection
-default_start_date = datetime.now() - timedelta(days=365)
+default_start_date = datetime.now() - timedelta(days=3650)
 start_date = st.sidebar.date_input(
     "Start Date",
     value=default_start_date,
     min_value=datetime(2010, 1, 1),
     max_value=datetime.now() - timedelta(days=1),
 )
-
-# Add option to use custom tickers
-use_custom_tickers = st.sidebar.checkbox("Use Custom Tickers")
-custom_tickers_input = ""
-if use_custom_tickers:
-    custom_tickers_input = st.sidebar.text_area(
-        "Enter ticker symbols (one per line)", ""
-    )
 
 # Advanced parameters
 st.sidebar.subheader("Eigenvalue Parameters")
@@ -87,7 +157,7 @@ eigenvalue_sell_threshold = st.sidebar.slider(
 )
 
 # Option to force refresh data
-force_refresh = st.sidebar.checkbox("Force Data Refresh")
+# force_refresh = st.sidebar.checkbox("Force Data Refresh")
 
 # Run button
 run_button = st.sidebar.button("Run Screener")
@@ -96,18 +166,25 @@ run_button = st.sidebar.button("Run Screener")
 st.header("Attractive Stocks Based on Eigenvalue Analysis")
 
 if run_button:
-    # Parse custom tickers if provided
-    tickers_to_use = DEFAULT_TICKERS
-    if use_custom_tickers and custom_tickers_input.strip():
+    # Determine which ticker list to use
+    if ticker_source == "Saved Stock List":
+        tickers_to_use = saved_tickers
+    elif ticker_source == "Default Stocks":
+        tickers_to_use = DEFAULT_TICKERS
+    else:  # Custom Input
         tickers_to_use = [
             ticker.strip().upper()
             for ticker in custom_tickers_input.split("\n")
             if ticker.strip()
         ]
+        if not tickers_to_use:
+            st.warning("No tickers entered. Using default tickers instead.")
+            tickers_to_use = DEFAULT_TICKERS
 
     # Initialize screener
-    screener = StockScreener(cache_dir="data/cache")
+    screener = StockScreener(cache_dir=CACHE_DIR)
 
+    # Rest of your existing code continues here...
     # Set screener parameters
     screener.analyzer.params["eigenvalue_count"] = eigenvalue_count
     screener.analyzer.params["eigenvalue_buy_threshold"] = eigenvalue_buy_threshold
@@ -121,10 +198,9 @@ if run_button:
         results = screener.screen_stocks(
             tickers_to_use,
             start_date=start_datetime,
-            force_refresh=force_refresh,
-            analyze_full_history=True,  # New parameter to ensure full analysis
+            force_refresh=False,
+            analyze_full_history=True,
         )
-
     if results:
         # Display results as a table
         st.subheader("Ranked Stocks by Breakout Potential")
@@ -152,7 +228,7 @@ if run_button:
         st.subheader("Detailed Analysis of Top Stocks")
 
         # Select top stocks to show (one per row with full width)
-        top_stocks = results[:3]
+        top_stocks = results[:10]
         for i, stock in enumerate(top_stocks):
             st.markdown(f"### {stock['ticker']}")
 
@@ -172,9 +248,7 @@ if run_button:
                 # Get the subset of price data that aligns with eigenvalue history
                 if len(stock["eigenvalue_history"]) > 0:
                     # Plot price history - show more data points for longer history
-                    display_window = min(
-                        len(ticker_data), 500
-                    )  # Show up to 500 trading days
+                    display_window = len(ticker_data)
                     date_subset = ticker_data.index[-display_window:]
                     price_subset = ticker_data["Close"].values[-display_window:]
 
