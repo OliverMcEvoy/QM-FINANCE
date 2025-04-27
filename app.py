@@ -2,10 +2,11 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
-from matplotlib.dates import DateFormatter, AutoDateLocator
+from matplotlib.dates import DateFormatter, AutoDateLocator, HourLocator, MinuteLocator
 import backtrader as bt
 import numpy as np
 import yfinance as yf
+import io
 
 # --- Import local modules ---
 from utils.data_fetcher import get_stock_data
@@ -138,7 +139,6 @@ if run_button:
 
         # Rename columns for both feeds to Backtrader standard
         def rename_columns(df):
-            # --- MODIFICATION START ---
             # Handle potential MultiIndex columns from yfinance
             if isinstance(df.columns, pd.MultiIndex):
                 # Flatten MultiIndex: Use the first level (e.g., 'Open', 'Close')
@@ -147,7 +147,6 @@ if run_button:
             else:
                 # Ensure regular column index elements are strings
                 df.columns = [str(col) for col in df.columns]
-            # --- MODIFICATION END ---
 
             cols = {
                 col.lower(): col for col in df.columns
@@ -171,17 +170,16 @@ if run_button:
                 rename_map[cols["adj_close"]] = "Adj Close"
             return df.rename(columns=rename_map)
 
-        hist_bt = rename_columns(hist_data)
-        # Add a print statement to debug the columns before renaming minute data
-        # print("Minute data columns BEFORE rename:", minute_data.columns)
-        minute_bt = rename_columns(minute_data)
-        # Add a print statement to debug the columns after renaming minute data
-        # print("Minute data columns AFTER rename:", minute_bt.columns)
+        hist_bt = rename_columns(
+            hist_data.copy()
+        )  # Use copy to avoid modifying original
+        minute_bt = rename_columns(
+            minute_data.copy()
+        )  # Use copy to avoid modifying original
 
         # Ensure required columns exist
         required_cols = ["Open", "High", "Low", "Close", "Volume"]
         if not all(col in hist_bt.columns for col in required_cols):
-
             st.error(
                 f"Historical data missing required columns: {required_cols}. Available: {hist_bt.columns.tolist()}"
             )
@@ -194,30 +192,115 @@ if run_button:
 
         # --- Historical backtest to init eigenvalues ---
         cerebro_hist = bt.Cerebro()
-        # --- MODIFICATION START ---
         # Disable trading for the historical run
         hist_params = strategy_params.copy()
         hist_params["trading_enabled"] = False
         cerebro_hist.addstrategy(SelectedStrategy, **hist_params)
-        # --- MODIFICATION END ---
         hist_feed = bt.feeds.PandasData(dataname=hist_bt)
         cerebro_hist.adddata(hist_feed)
-        cerebro_hist.broker.setcash(
-            start_cash
-        )  # Keep initial cash for potential commission calculations if needed
-        cerebro_hist.broker.setcommission(commission=0.001)  # Add commission
-        with st.spinner(
-            "Running historical backtest (state initialization)..."
-        ):  # Modified spinner text
+        cerebro_hist.broker.setcash(start_cash)
+        cerebro_hist.broker.setcommission(commission=0.001)
+        hist_strat = None  # Initialize hist_strat
+        with st.spinner("Running historical backtest (state initialization)..."):
             try:
                 hist_strats = cerebro_hist.run()
                 if not hist_strats:
                     st.error("Historical backtest failed to run.")
                     st.stop()
-                hist_strat = hist_strats[0]
+                hist_strat = hist_strats[0]  # Assign hist_strat here
             except Exception as e:
                 st.error(f"Error during historical backtest: {e}")
                 st.stop()
+
+        # --- Plot Historical Eigenvalues ---
+        if hist_strats and hasattr(hist_strat, "get_wavefunction_data"):
+            hist_wf_data = hist_strat.get_wavefunction_data()
+            hist_dates = hist_wf_data.get("dates", [])
+            hist_prices = hist_wf_data.get("prices", [])
+            hist_eigenvalue_history = hist_wf_data.get("eigenvalue_history", [])
+
+            # Ensure alignment for historical data
+            hist_min_len = min(
+                len(hist_dates), len(hist_prices), len(hist_eigenvalue_history)
+            )
+            hist_dates = hist_dates[:hist_min_len]
+            hist_prices = hist_prices[:hist_min_len]
+            hist_eigenvalue_history = hist_eigenvalue_history[:hist_min_len]
+
+            if hist_dates and hist_prices and hist_eigenvalue_history:
+                st.subheader("Historical Eigenvalue Evolution (Initialization Period)")
+                fig_hist_eig, ax_hist_eig = plt.subplots(
+                    figsize=(12, 6), facecolor="none"
+                )
+                ax_hist_eig.set_facecolor("none")
+                ax_hist_eig.plot(
+                    hist_dates,
+                    hist_prices,
+                    label="Historical Price",
+                    color="grey",
+                    linewidth=2.5,  # Changed from 1.5 to 2.5
+                    zorder=1,
+                    alpha=0.8,
+                )
+
+                hist_max_levels = 0
+                if hist_eigenvalue_history:
+                    # Filter out empty lists before finding max length
+                    valid_hist_eigenvalues = [h for h in hist_eigenvalue_history if h]
+                    if valid_hist_eigenvalues:
+                        hist_max_levels = max(len(h) for h in valid_hist_eigenvalues)
+                        hist_max_levels = min(
+                            hist_max_levels, strategy_params.get("eigenvalue_count", 5)
+                        )  # Use configured count
+
+                if hist_max_levels > 0:
+                    for i in range(hist_max_levels):
+                        vals, ds = [], []
+                        for j, h in enumerate(hist_eigenvalue_history):
+                            if h and i < len(h):
+                                ds.append(hist_dates[j])
+                                vals.append(h[i])
+                        if ds:
+                            color_val = (
+                                i / (hist_max_levels - 1)
+                                if hist_max_levels > 1
+                                else 0.5
+                            )
+                            ax_hist_eig.plot(
+                                ds,
+                                vals,
+                                label=f"Hist Level {i+1}",
+                                linewidth=1,
+                                alpha=0.7,
+                                color=plt.cm.viridis(color_val),
+                            )
+
+                hist_locator = AutoDateLocator(minticks=5, maxticks=12)
+                hist_formatter = DateFormatter("%Y-%m-%d")
+                ax_hist_eig.xaxis.set_major_locator(hist_locator)
+                ax_hist_eig.xaxis.set_major_formatter(hist_formatter)
+                fig_hist_eig.autofmt_xdate()
+
+                for spine in ax_hist_eig.spines.values():
+                    spine.set_color("white")
+                    spine.set_linewidth(2)
+                ax_hist_eig.tick_params(axis="x", colors="white", labelsize=10, width=2)
+                ax_hist_eig.tick_params(axis="y", colors="white", labelsize=10, width=2)
+                ax_hist_eig.set_xlabel(
+                    "Date", fontsize=12, color="white", weight="bold"
+                )
+                ax_hist_eig.set_ylabel(
+                    "Price", fontsize=12, color="white", weight="bold"
+                )
+                ax_hist_eig.legend(framealpha=0.3, fontsize=8)
+                fig_hist_eig.patch.set_alpha(0.0)
+                ax_hist_eig.patch.set_alpha(0.0)
+                st.pyplot(fig_hist_eig)
+            else:
+                st.warning(
+                    "Could not retrieve sufficient data for historical eigenvalue plot."
+                )
+        # --- End Historical Eigenvalue Plot ---
 
         # --- Minute-by-minute simulation for last week ---
         minute_params = strategy_params.copy()
@@ -250,6 +333,8 @@ if run_button:
             start_cash
         )  # Start minute simulation with initial cash
         cerebro_min.broker.setcommission(commission=0.001)
+        strat = None  # Initialize strat
+        final_value = start_cash  # Initialize final_value
         with st.spinner(
             "Running minute-by-minute simulation (trading enabled)..."
         ):  # Modified spinner text
@@ -291,31 +376,31 @@ if run_button:
             unsafe_allow_html=True,
         )
 
-        # 5. Plot Price with Buy/Sell Signals (Minute Data)
+        # 5. Plot Price with Buy/Sell Signals (Minute Data - Last 7 Days Combined)
         st.subheader("Minute Price Chart with Buy/Sell Signals (Last 7 Days)")
-        fig, ax = plt.subplots(figsize=(12, 6), facecolor="none")
-        ax.set_facecolor("none")
-        ax.grid(False)
+        fig_combined, ax_combined = plt.subplots(figsize=(12, 6), facecolor="none")
+        ax_combined.set_facecolor("none")
+        ax_combined.grid(False)
 
-        ax.plot(
+        ax_combined.plot(
             minute_bt.index,
             minute_bt["Close"],
             label="Close Price",
             color="steelblue",
-            linewidth=1.5,  # Thinner line for minute data
+            linewidth=2.5,  # Changed from 1.5 to 2.5
             zorder=1,
         )
-        locator = AutoDateLocator(
+        locator_combined = AutoDateLocator(
             minticks=5, maxticks=12
         )  # Adjust ticks for minute data
-        formatter = DateFormatter("%m-%d %H:%M")  # Format for minute data
-        ax.xaxis.set_major_locator(locator)
-        ax.xaxis.set_major_formatter(formatter)
-        fig.autofmt_xdate()
+        formatter_combined = DateFormatter("%m-%d %H:%M")  # Format for minute data
+        ax_combined.xaxis.set_major_locator(locator_combined)
+        ax_combined.xaxis.set_major_formatter(formatter_combined)
+        fig_combined.autofmt_xdate()
 
-        if hasattr(strat, "buy_signals") and strat.buy_signals:
+        if strat is not None and hasattr(strat, "buy_signals") and strat.buy_signals:
             buy_dates, buy_prices, buy_values = zip(*strat.buy_signals)
-            ax.scatter(
+            ax_combined.scatter(
                 buy_dates,
                 buy_prices,
                 marker="^",
@@ -326,9 +411,9 @@ if run_button:
                 zorder=3,
             )
 
-        if hasattr(strat, "sell_signals") and strat.sell_signals:
+        if strat is not None and hasattr(strat, "sell_signals") and strat.sell_signals:
             sell_dates, sell_prices, sell_values = zip(*strat.sell_signals)
-            ax.scatter(
+            ax_combined.scatter(
                 sell_dates,
                 sell_prices,
                 marker="v",
@@ -339,44 +424,55 @@ if run_button:
                 zorder=3,
             )
 
-        for spine in ax.spines.values():
+        for spine in ax_combined.spines.values():
             spine.set_color("white")
             spine.set_linewidth(2)
 
-        ax.tick_params(
+        ax_combined.tick_params(
             axis="x", colors="white", labelsize=10, width=2
         )  # Smaller labels
-        ax.tick_params(axis="y", colors="white", labelsize=10, width=2)
-        ax.set_xlabel("Date / Time", fontsize=12, color="white", weight="bold")
-        ax.set_ylabel("Price", fontsize=12, color="white", weight="bold")
-        ax.legend(framealpha=0.3)
-        fig.patch.set_alpha(0.0)
-        ax.patch.set_alpha(0.0)
-        st.pyplot(fig)
+        ax_combined.tick_params(axis="y", colors="white", labelsize=10, width=2)
+        ax_combined.set_xlabel("Date / Time", fontsize=12, color="white", weight="bold")
+        ax_combined.set_ylabel("Price", fontsize=12, color="white", weight="bold")
+        ax_combined.legend(framealpha=0.3)
+        fig_combined.patch.set_alpha(0.0)
+        ax_combined.patch.set_alpha(0.0)
+        st.pyplot(fig_combined)
 
         # 6. Quantum Visualizations for minute-by-minute simulation
-        if strategy_name == "CustomQuantum" and hasattr(strat, "get_wavefunction_data"):
+        if (
+            strat is not None
+            and strategy_name == "CustomQuantum"
+            and hasattr(strat, "get_wavefunction_data")
+        ):
             wf_data = strat.get_wavefunction_data()
 
-            # Ensure data alignment
-            min_len = min(
-                len(wf_data["dates"]),
-                len(wf_data["prices"]),
-                len(wf_data["wavefunction"]),
-                len(wf_data["eigenvalue_history"]),
-            )
-            dates = wf_data["dates"][:min_len]
-            prices = wf_data["prices"][:min_len]
-            wavefunction = wf_data["wavefunction"][:min_len]
-            history = wf_data["eigenvalue_history"][:min_len]
-            eigenvalue_signals = (
-                wf_data["eigenvalue_signals"][:min_len]
-                if wf_data["eigenvalue_signals"]
-                else []
-            )
+            # Extract data from strategy
+            all_dates = wf_data.get("dates", [])
+            all_prices = wf_data.get("prices", [])
+            all_wavefunction = wf_data.get("wavefunction", [])
+            all_eigenvalue_history = wf_data.get("eigenvalue_history", [])
+            all_buy_signals = wf_data.get("buy_signals", [])
+            all_sell_signals = wf_data.get("sell_signals", [])
+            all_trades = wf_data.get("trades", [])
 
-            # 6a. Wavefunction vs. Price
-            st.subheader("Quantum Wavefunction vs. Price (Minute Data)")
+            # Ensure data alignment for minute data
+            min_len = min(
+                len(all_dates),
+                len(all_prices),
+                len(all_wavefunction),
+                len(all_eigenvalue_history),
+            )
+            dates = all_dates[:min_len]
+            prices = all_prices[:min_len]
+            wavefunction = all_wavefunction[:min_len]
+            history = all_eigenvalue_history[:min_len]
+
+            # Convert dates to pandas DatetimeIndex for easier filtering
+            dates_idx = pd.to_datetime(dates)
+
+            # 6a. Wavefunction vs. Price (Combined 7 days)
+            st.subheader("Quantum Wavefunction vs. Price (Minute Data - Last 7 Days)")
             fig2, ax2 = plt.subplots(figsize=(12, 6), facecolor="none")
             ax2.set_facecolor("none")
             ax2.plot(
@@ -385,7 +481,7 @@ if run_button:
                 label="Actual Price",
                 color="steelblue",
                 alpha=0.7,
-                linewidth=1.5,
+                linewidth=2.5,  # Changed from 1.5 to 2.5
             )
             ax2.plot(
                 dates,
@@ -394,8 +490,10 @@ if run_button:
                 color="#E833FF",
                 linewidth=1.5,
             )
-            ax2.xaxis.set_major_locator(locator)
-            ax2.xaxis.set_major_formatter(formatter)
+            ax2.xaxis.set_major_locator(
+                locator_combined
+            )  # Use same locator as combined price chart
+            ax2.xaxis.set_major_formatter(formatter_combined)  # Use same formatter
             fig2.autofmt_xdate()
             for spine in ax2.spines.values():
                 spine.set_color("white")
@@ -409,20 +507,21 @@ if run_button:
             ax2.patch.set_alpha(0.0)
             st.pyplot(fig2)
 
-            # 6b. Eigenvalue Evolution (Support/Resistance Levels)
+            # 6b. Eigenvalue Evolution (Combined 7 days)
             st.subheader(
-                "Eigenvalue Evolution (Support/Resistance Levels - Minute Data)"
+                "Eigenvalue Evolution (Support/Resistance Levels - Minute Data - Last 7 Days)"
             )
             fig4, ax4 = plt.subplots(figsize=(12, 6), facecolor="none")
             ax4.set_facecolor("none")
 
             # determine max levels dynamically
             max_levels = 0
-            if history:
-                max_levels = max(
-                    len(h) for h in history if h
-                )  # Find max number of levels in any step
-                max_levels = min(max_levels, 5)  # Limit to 5 levels for clarity
+            valid_history = [h for h in history if h]  # Filter out empty lists
+            if valid_history:
+                max_levels = max(len(h) for h in valid_history)
+                max_levels = min(
+                    max_levels, strategy_params.get("eigenvalue_count", 5)
+                )  # Use configured count
 
             if max_levels > 0:
                 for i in range(max_levels):
@@ -434,20 +533,26 @@ if run_button:
                             ds.append(dates[j])
                             vals.append(h[i])
                     if ds:  # Only plot if there's data for this level
+                        color_val = i / (max_levels - 1) if max_levels > 1 else 0.5
                         ax4.plot(
                             ds,
                             vals,
                             label=f"Level {i+1}",
                             linewidth=1,
                             alpha=0.8,
-                            color=plt.cm.rainbow(i / (max_levels - 1)),
+                            color=plt.cm.rainbow(color_val),
                         )
 
             ax4.plot(
-                dates, prices, label="Price", color="steelblue", linewidth=1.5, zorder=1
+                dates,
+                prices,
+                label="Price",
+                color="steelblue",
+                linewidth=2.5,
+                zorder=1,  # Changed from 1.5 to 2.5
             )
-            ax4.xaxis.set_major_locator(locator)
-            ax4.xaxis.set_major_formatter(formatter)
+            ax4.xaxis.set_major_locator(locator_combined)
+            ax4.xaxis.set_major_formatter(formatter_combined)
             fig4.autofmt_xdate()
             for spine in ax4.spines.values():
                 spine.set_color("white")
@@ -461,8 +566,8 @@ if run_button:
             ax4.patch.set_alpha(0.0)
             st.pyplot(fig4)
 
-            # 6c. Combined Quantum Trading Visualization
-            st.subheader("Combined Quantum Visualization (Minute Data)")
+            # 6c. Combined Quantum Trading Visualization (Combined 7 days)
+            st.subheader("Combined Quantum Visualization (Minute Data - Last 7 Days)")
             fig5, ax5 = plt.subplots(figsize=(12, 6), facecolor="none")
             ax5.set_facecolor("none")
             ax5.plot(
@@ -470,7 +575,7 @@ if run_button:
                 prices,
                 label="Price",
                 color="steelblue",
-                linewidth=1.5,
+                linewidth=2.5,  # Changed from 1.5 to 2.5
                 alpha=0.9,
                 zorder=1,
             )
@@ -492,19 +597,20 @@ if run_button:
                             ds.append(dates[j])
                             vals.append(h[i])
                     if ds:
+                        color_val = i / (max_levels - 1) if max_levels > 1 else 0.5
                         ax5.plot(
                             ds,
                             vals,
                             linestyle="--",
                             linewidth=1,
                             alpha=0.6,
-                            color=plt.cm.rainbow(i / (max_levels - 1)),
+                            color=plt.cm.rainbow(color_val),
                             zorder=3,
                             label=f"Level {i+1}" if i == 0 else f"_Level {i+1}",
                         )  # Only label first level
 
-            if hasattr(strat, "buy_signals") and strat.buy_signals:
-                bd, bp, _ = zip(*strat.buy_signals)
+            if all_buy_signals:
+                bd, bp, _ = zip(*all_buy_signals)
                 ax5.scatter(
                     bd,
                     bp,
@@ -515,8 +621,8 @@ if run_button:
                     label="Buys",
                     zorder=5,
                 )
-            if hasattr(strat, "sell_signals") and strat.sell_signals:
-                sd, sp, _ = zip(*strat.sell_signals)
+            if all_sell_signals:
+                sd, sp, _ = zip(*all_sell_signals)
                 ax5.scatter(
                     sd,
                     sp,
@@ -528,35 +634,14 @@ if run_button:
                     zorder=5,
                 )
 
-            handles, labels = (
-                ax5.get_legend_handles_labels()
-            )  # Get handles before adding twin axis
+            handles, labels = ax5.get_legend_handles_labels()  # Get handles
 
-            if eigenvalue_signals:
-                ax_sig = ax5.twinx()
-                sd2, bs, ss = zip(*eigenvalue_signals)
-                h_buy_sig = ax_sig.fill_between(
-                    sd2, 0, bs, color="green", alpha=0.2, label="Buy Strength"
-                )
-                h_sell_sig = ax_sig.fill_between(
-                    sd2, 0, ss, color="red", alpha=0.2, label="Sell Strength"
-                )
-                ax_sig.set_ylim(0, 1)
-                ax_sig.tick_params(axis="y", colors="white", labelsize=10)
-                ax_sig.set_ylabel("Signal Strength", color="white", fontsize=10)
-                handles.extend([h_buy_sig, h_sell_sig])
-                labels.extend(["Buy Strength", "Sell Strength"])
-
-            ax5.xaxis.set_major_locator(locator)
-            ax5.xaxis.set_major_formatter(formatter)
+            ax5.xaxis.set_major_locator(locator_combined)
+            ax5.xaxis.set_major_formatter(formatter_combined)
             fig5.autofmt_xdate()
             for spine in ax5.spines.values():
                 spine.set_color("white")
                 spine.set_linewidth(2)
-            if "ax_sig" in locals():
-                for spine in ax_sig.spines.values():
-                    spine.set_color("white")
-                    spine.set_linewidth(1)  # Make twin axis spines thinner
 
             ax5.tick_params(axis="x", colors="white", labelsize=10, width=2)
             ax5.tick_params(axis="y", colors="white", labelsize=10, width=2)
@@ -569,7 +654,153 @@ if run_button:
             ax5.legend(handles, labels, framealpha=0.3, loc="upper left", fontsize=8)
             st.pyplot(fig5)
 
-            # 6d. Eigenvalue Trading Signals Plot (Removed redundant plot, combined above)
+            # --- START: Daily Plots ---
+            st.subheader("Daily Trading Session Visualizations (Last 7 Days)")
+            unique_days = dates_idx.normalize().unique()  # Get unique days
+
+            for day in unique_days:
+                day_str = day.strftime("%Y-%m-%d")
+                st.markdown(f"#### {day_str}")
+
+                # Filter data for the current day
+                day_mask = (dates_idx >= day) & (dates_idx < day + timedelta(days=1))
+                day_dates = [d for d, m in zip(dates, day_mask) if m]
+                day_prices = [p for p, m in zip(prices, day_mask) if m]
+                day_wavefunction = [w for w, m in zip(wavefunction, day_mask) if m]
+                day_history = [h for h, m in zip(history, day_mask) if m]
+
+                day_buy_signals = [
+                    (d, p, v)
+                    for d, p, v in all_buy_signals
+                    if day <= d < day + timedelta(days=1)
+                ]
+                day_sell_signals = [
+                    (d, p, v)
+                    for d, p, v in all_sell_signals
+                    if day <= d < day + timedelta(days=1)
+                ]
+
+                if not day_dates:  # Skip if no data for this day (e.g., weekend)
+                    st.write("No trading data for this day.")
+                    continue
+
+                fig_day, ax_day = plt.subplots(
+                    figsize=(12, 5), facecolor="none"
+                )  # Slightly smaller height
+                ax_day.set_facecolor("none")
+
+                ax_day.plot(
+                    day_dates,
+                    day_prices,
+                    label="Price",
+                    color="steelblue",
+                    linewidth=2.5,  # Changed from 1.5 to 2.5
+                    alpha=0.9,
+                    zorder=1,
+                )
+                ax_day.plot(
+                    day_dates,
+                    day_wavefunction,
+                    label="Wavefunction",
+                    color="#E833FF",
+                    linewidth=1,
+                    alpha=0.5,
+                    zorder=2,
+                )
+
+                day_max_levels = 0
+                valid_day_history = [h for h in day_history if h]
+                if valid_day_history:
+                    day_max_levels = max(len(h) for h in valid_day_history)
+                    day_max_levels = min(
+                        day_max_levels, strategy_params.get("eigenvalue_count", 5)
+                    )
+
+                if day_max_levels > 0:
+                    for i in range(day_max_levels):
+                        vals, ds = [], []
+                        for j, h in enumerate(day_history):
+                            if h and i < len(h):
+                                ds.append(day_dates[j])
+                                vals.append(h[i])
+                        if ds:
+                            color_val = (
+                                i / (day_max_levels - 1) if day_max_levels > 1 else 0.5
+                            )
+                            ax_day.plot(
+                                ds,
+                                vals,
+                                linestyle="--",
+                                linewidth=1,
+                                alpha=0.6,
+                                color=plt.cm.rainbow(color_val),
+                                zorder=3,
+                                label=f"Level {i+1}" if i == 0 else f"_Level {i+1}",
+                            )
+
+                if day_buy_signals:
+                    bd, bp, _ = zip(*day_buy_signals)
+                    ax_day.scatter(
+                        bd,
+                        bp,
+                        marker="^",
+                        s=80,
+                        edgecolor="green",
+                        facecolor="white",
+                        label="Buys",
+                        zorder=5,
+                    )
+                if day_sell_signals:
+                    sd, sp, _ = zip(*day_sell_signals)
+                    ax_day.scatter(
+                        sd,
+                        sp,
+                        marker="v",
+                        s=80,
+                        edgecolor="red",
+                        facecolor="white",
+                        label="Sells",
+                        zorder=5,
+                    )
+
+                handles_day, labels_day = ax_day.get_legend_handles_labels()
+
+                # Formatting for daily plots (more granular time)
+                ax_day.xaxis.set_major_locator(
+                    HourLocator(interval=1)
+                )  # Tick every hour
+                ax_day.xaxis.set_minor_locator(
+                    MinuteLocator(interval=15)
+                )  # Minor tick every 15 mins
+                ax_day.xaxis.set_major_formatter(
+                    DateFormatter("%H:%M")
+                )  # Show Hour:Minute
+                fig_day.autofmt_xdate()
+
+                for spine in ax_day.spines.values():
+                    spine.set_color("white")
+                    spine.set_linewidth(1.5)
+                ax_day.tick_params(axis="x", colors="white", labelsize=9, width=1.5)
+                ax_day.tick_params(axis="y", colors="white", labelsize=9, width=1.5)
+                ax_day.set_xlabel(
+                    "Time (HH:MM)", fontsize=10, color="white", weight="bold"
+                )
+                ax_day.set_ylabel(
+                    "Price / Value", fontsize=10, color="white", weight="bold"
+                )
+                fig_day.patch.set_alpha(0.0)
+                ax_day.patch.set_alpha(0.0)
+                ax_day.legend(
+                    handles_day,
+                    labels_day,
+                    framealpha=0.3,
+                    loc="upper left",
+                    fontsize=8,
+                )
+                st.pyplot(fig_day)
+                plt.close(fig_day)  # Close the figure to free memory
+
+            # --- END: Daily Plots ---
 
             # Explanation and Trade Log
             st.subheader("Strategy Explanation & Trade Log")
@@ -593,14 +824,23 @@ if run_button:
                 """
             )
 
-            if hasattr(strat, "trades") and strat.trades:
-                trades_df = pd.DataFrame(strat.trades)
+            if all_trades:
+                trades_df = pd.DataFrame(all_trades)
+                # Ensure dates are timezone-naive before formatting
                 trades_df["buy_date"] = pd.to_datetime(
                     trades_df["buy_date"]
-                ).dt.strftime("%Y-%m-%d %H:%M")
+                ).dt.tz_localize(None)
                 trades_df["sell_date"] = pd.to_datetime(
                     trades_df["sell_date"]
-                ).dt.strftime("%Y-%m-%d %H:%M")
+                ).dt.tz_localize(None)
+
+                trades_df["buy_date"] = trades_df["buy_date"].dt.strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+                trades_df["sell_date"] = trades_df["sell_date"].dt.strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+
                 trades_df["pnl_pct"] = (
                     (trades_df["sell_price"] - trades_df["buy_price"])
                     / trades_df["buy_price"]
@@ -650,33 +890,50 @@ if run_button:
                     "{:,.2f}%".format
                 )
 
+                # Define coloring function safely
+                def color_pnl(val):
+                    color = "white"  # Default
+                    try:
+                        # Check if it's a string representation of a number/percentage
+                        if isinstance(val, str):
+                            numeric_val_str = val.replace("%", "").replace(",", "")
+                            numeric_val = float(numeric_val_str)
+                        elif isinstance(val, (int, float)):
+                            numeric_val = val
+                        else:
+                            return (
+                                f"color: {color}"  # Return default if not convertible
+                            )
+
+                        if numeric_val > 0:
+                            color = "lightgreen"
+                        elif numeric_val < 0:
+                            color = "lightcoral"
+                    except (ValueError, TypeError):
+                        pass  # Keep default color if conversion fails
+                    return f"color: {color}"
+
                 st.dataframe(
                     trades_df_display.style.applymap(
-                        lambda x: (
-                            "color: lightgreen"
-                            if isinstance(x, str)
-                            and x.startswith("+")
-                            or (isinstance(x, (int, float)) and x > 0)
-                            else (
-                                "color: lightcoral"
-                                if isinstance(x, str)
-                                and x.startswith("-")
-                                or (isinstance(x, (int, float)) and x < 0)
-                                else "color: white"
-                            )
-                        ),
-                        subset=["PnL ($)", "PnL (%)"],
+                        color_pnl, subset=["PnL ($)", "PnL (%)"]
                     )
                 )
             else:
                 st.write("No trades executed during the minute simulation period.")
 
-        else:
+        elif (
+            strat
+        ):  # If strat exists but it's not CustomQuantum or doesn't have get_wavefunction_data
             st.warning(
                 "Selected strategy does not provide detailed quantum visualization data."
             )
+        # else: # If strat is None (simulation failed earlier) - error already shown
 
 else:
     st.info(
         "Configure the backtest parameters in the sidebar and click 'Run Backtest'."
     )
+
+# --- Helper to close figures ---
+# (Optional: Explicitly close all figures at the end, though Streamlit usually handles this)
+# plt.close('all')

@@ -40,14 +40,14 @@ def get_stock_data(ticker, start_date, end_date):
             f"Columns after lowercasing: {data.columns.tolist()}"
         )  # Add print for debugging
 
-        # Define the standard names backtrader expects
+        # Define the standard names backtrader expects (lowercase keys, capitalized values)
         required_cols_map = {
-            "open": "open",
-            "high": "high",
-            "low": "low",
-            "close": "close",
-            "adj close": "adj_close",  # yfinance often uses 'adj close'
-            "volume": "volume",
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "adj close": "Adj Close",  # yfinance often uses 'adj close'
+            "volume": "Volume",
         }
 
         # Rename columns based on the map
@@ -56,19 +56,23 @@ def get_stock_data(ticker, start_date, end_date):
             f"Columns after renaming: {data.columns.tolist()}"
         )  # Add print for debugging
 
-        # Select only the columns backtrader needs
-        final_cols = ["open", "high", "low", "close", "volume"]
-        if "adj_close" in data.columns:
-            # If you prefer adjusted close for backtesting, rename it to 'close'
-            # data.rename(columns={'adj_close': 'close'}, inplace=True)
+        # Select only the columns backtrader needs (using capitalized names now)
+        final_cols = ["Open", "High", "Low", "Close", "Volume"]
+        if "Adj Close" in data.columns:
             # Or just include it if your strategy uses it separately
-            final_cols.append("adj_close")
+            final_cols.append("Adj Close")
 
         # Filter data to keep only required columns that actually exist
         cols_to_keep = [col for col in final_cols if col in data.columns]
         missing_core_cols = [
             c
-            for c in ["open", "high", "low", "close", "volume"]
+            for c in [
+                "Open",
+                "High",
+                "Low",
+                "Close",
+                "Volume",
+            ]  # Check for capitalized core cols
             if c not in cols_to_keep
         ]
 
@@ -79,6 +83,8 @@ def get_stock_data(ticker, start_date, end_date):
             return None
 
         data = data[cols_to_keep]
+        # --- REMOVED redundant capitalization here, already done by rename ---
+        # data.columns = [col.capitalize() for col in data.columns]
         print(
             f"Final columns being passed to backtrader: {data.columns.tolist()}"
         )  # Add print for debugging

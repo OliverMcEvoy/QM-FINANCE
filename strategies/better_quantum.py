@@ -59,6 +59,8 @@ class CustomQuantumStrategy(bt.Strategy):
         ("initial_quantum_state", None),
         # Control trading execution
         ("trading_enabled", True),  # <<< ADDED PARAMETER
+        # New parameter for stop loss
+        ("stop_loss_atr", 2.0),  # Stop loss at 2x ATR
     )
 
     def __init__(self, *args, **kwargs):
@@ -114,6 +116,34 @@ class CustomQuantumStrategy(bt.Strategy):
 
         # Track eigenvalue-based signals for visualization
         self.eigenvalue_signals = []
+
+    def _apply_slippage_protection(self, buy_price, action="buy"):
+        """Apply slippage protection - assume worse prices for safety"""
+        slippage_factor = 0.001  # 0.1% slippage
+        if action == "buy":
+            return buy_price * (1 + slippage_factor)  # Higher price for buys
+        else:
+            return buy_price * (1 - slippage_factor)  # Lower price for sells
+
+    def _calculate_atr(self, period=14):
+        """Calculate Average True Range for volatility-based stops"""
+        if len(self.data) < period + 1:
+            return None
+
+        true_ranges = []
+        for i in range(1, period + 1):
+            high = self.data.high[-i]
+            low = self.data.low[-i]
+            prev_close = self.data.close[-(i + 1)]
+
+            tr1 = high - low
+            tr2 = abs(high - prev_close)
+            tr3 = abs(low - prev_close)
+
+            true_range = max(tr1, tr2, tr3)
+            true_ranges.append(true_range)
+
+        return sum(true_ranges) / len(true_ranges)
 
     def next(self):
         # Skip if not enough data
@@ -269,29 +299,71 @@ class CustomQuantumStrategy(bt.Strategy):
         if self.p.trading_enabled:  # <<< ADDED CHECK
             if not self.position:  # Not in market
                 if final_buy_prob > self.p.prob_threshold:
-                    # --- MODIFIED BUY SIZING ---
-                    # Always use the maximum allowed percentage of cash
+                    # --- IMPROVED POSITION SIZING ---
+                    # Kelly-inspired position sizing based on signal strength
+                    kelly_fraction = 2 * (
+                        final_buy_prob - 0.5
+                    )  # Ranges from 0 to 1 as prob goes from 0.5 to 1.0
+                    # Apply a half-Kelly for safety (less aggressive)
+                    position_fraction = min(
+                        self.p.max_position_pct, kelly_fraction * 0.5
+                    )
+
+                    # Ensure reasonable minimum position size
+                    position_fraction = max(0.1, position_fraction)
+
                     available_cash = self.broker.getcash()
-                    cash_to_use = (
-                        available_cash * self.p.max_position_pct
-                    )  # Use max allowed cash
+                    cash_to_use = available_cash * position_fraction
+
+                    # Apply slippage protection to get realistic price
+                    adjusted_price = self._apply_slippage_protection(price, "buy")
 
                     # Calculate shares and actual buy value
-                    shares = int(cash_to_use / price)
+                    shares = int(cash_to_use / adjusted_price)
                     if shares > 0:
                         buy_value = shares * price
                         self.buy(size=shares)
-                        self.buy_signals.append(
-                            (dt, price, buy_value)
-                        )  # Store buy value
+                        self.buy_signals.append((dt, price, buy_value))
                         self.current_trade = {
                             "buy_date": dt,
                             "buy_price": price,
                             "shares": shares,
-                            "buy_value": buy_value,  # Store buy value in trade log
+                            "buy_value": buy_value,
                         }
-                    # --- END MODIFIED BUY SIZING ---
+                    # --- END IMPROVED POSITION SIZING ---
             else:  # In market
+                # Check for stop loss based on ATR
+                atr = self._calculate_atr()
+                if atr and self.current_trade:
+                    stop_price = self.current_trade["buy_price"] - (
+                        atr * self.p.stop_loss_atr
+                    )
+                    if price <= stop_price:
+                        # Hit stop loss
+                        sell_value = self.position.size * price
+                        self.close()
+                        self.sell_signals.append((dt, price, sell_value))
+
+                        if self.current_trade:
+                            pnl = price - self.current_trade["buy_price"]
+                            total_pnl = pnl * self.current_trade["shares"]
+                            self.trades.append(
+                                {
+                                    "buy_date": self.current_trade["buy_date"],
+                                    "buy_price": self.current_trade["buy_price"],
+                                    "buy_value": self.current_trade["buy_value"],
+                                    "sell_date": dt,
+                                    "sell_price": price,
+                                    "sell_value": sell_value,
+                                    "shares": self.current_trade["shares"],
+                                    "total_pnl": total_pnl,
+                                    "stop_loss": True,  # Flag as stop loss
+                                }
+                            )
+                            self.current_trade = None
+                        return  # Skip regular sell logic after stop loss
+
+                # Regular sell logic
                 if final_sell_prob > self.p.prob_threshold:
                     # Calculate sell value (based on current position size)
                     sell_value = self.position.size * price
@@ -317,11 +389,11 @@ class CustomQuantumStrategy(bt.Strategy):
                                 "sell_value": sell_value,  # Add sell value
                                 "shares": self.current_trade["shares"],
                                 "total_pnl": total_pnl,
+                                "stop_loss": False,  # Regular sell
                             }
                         )
                         self.current_trade = None
 
-    # ... rest of the methods (_evaluate_eigenvalue_signals, _calculate_phase, etc.) remain unchanged ...
     def _evaluate_eigenvalue_signals(self, price, eigenvalues):
         """
         Generate buy/sell signals based on price position relative to eigenvalues
@@ -330,56 +402,59 @@ class CustomQuantumStrategy(bt.Strategy):
         if not eigenvalues or len(eigenvalues) == 0:
             return 0.0, 0.0
 
+        # Use ATR for adaptive thresholds if available
+        atr = self._calculate_atr()
+        atr_factor = (
+            0.5 if atr is None else min(0.05, atr / price)
+        )  # Cap at 5% of price
+
+        # Dynamic thresholds based on volatility
+        buy_threshold = max(self.p.eigenvalue_buy_threshold, atr_factor)
+        sell_threshold = max(self.p.eigenvalue_sell_threshold, atr_factor)
+
         # Sort eigenvalues to find lowest and highest
         sorted_eigenvalues = sorted(eigenvalues)
         lowest_eigenvalue = sorted_eigenvalues[0]
         highest_eigenvalue = sorted_eigenvalues[-1]
 
-        # Calculate relative position of price within eigenvalue range
-        eig_range = highest_eigenvalue - lowest_eigenvalue
-        if eig_range <= 0:
-            rel_position = 0.5  # Default to middle if all eigenvalues are the same
-        else:
-            rel_position = (price - lowest_eigenvalue) / eig_range
+        # Find nearest eigenvalues (support below, resistance above)
+        support_levels = [e for e in sorted_eigenvalues if e <= price]
+        resistance_levels = [e for e in sorted_eigenvalues if e >= price]
 
-        # Calculate distance to nearest eigenvalues as percentage
-        distances = [abs(price - eig) / price for eig in eigenvalues]
-        min_distance = min(distances) if distances else 1.0
+        nearest_support = max(support_levels) if support_levels else lowest_eigenvalue
+        nearest_resistance = (
+            min(resistance_levels) if resistance_levels else highest_eigenvalue
+        )
 
-        # Buy signal: stronger when price is near or below lowest eigenvalue (support)
-        # Linear signal strength that increases as price approaches or drops below support
-        buy_threshold = self.p.eigenvalue_buy_threshold
+        # Buy signal: stronger when price is near support
         buy_signal_strength = 0.0
-
-        if price <= lowest_eigenvalue:
-            # Price is below lowest eigenvalue (strong support signal)
-            distance_factor = min(1.0, min_distance / buy_threshold)
-            buy_signal_strength = 1.0 - (
-                distance_factor * 0.5
-            )  # Start at 0.5, go to 1.0 as gets closer
-        elif price <= lowest_eigenvalue * (1 + buy_threshold):
-            # Price is within threshold of lowest eigenvalue
-            proximity = (lowest_eigenvalue * (1 + buy_threshold) - price) / (
-                lowest_eigenvalue * buy_threshold
+        if price <= nearest_support:
+            # Price is at or below support
+            distance_factor = min(
+                1.0, abs(price - nearest_support) / (price * buy_threshold)
             )
-            buy_signal_strength = max(0.0, proximity * 0.8)  # Scale to 0.0-0.8
+            buy_signal_strength = 1.0 - (distance_factor * 0.5)
+        elif price <= nearest_support * (1 + buy_threshold):
+            # Price is within threshold of support
+            proximity = (nearest_support * (1 + buy_threshold) - price) / (
+                nearest_support * buy_threshold
+            )
+            buy_signal_strength = max(0.0, proximity * 0.8)
 
-        # Sell signal: stronger when price is near or above highest eigenvalue (resistance)
-        sell_threshold = self.p.eigenvalue_sell_threshold
+        # Sell signal: stronger when price is near resistance
         sell_signal_strength = 0.0
-
-        if price >= highest_eigenvalue:
-            # Price is above highest eigenvalue (strong resistance signal)
-            distance_factor = min(1.0, min_distance / sell_threshold)
-            sell_signal_strength = 1.0 - (
-                distance_factor * 0.5
-            )  # Start at 0.5, go to 1.0 as gets closer
-        elif price >= highest_eigenvalue * (1 - sell_threshold):
-            # Price is within threshold of highest eigenvalue
-            proximity = (price - highest_eigenvalue * (1 - sell_threshold)) / (
-                highest_eigenvalue * sell_threshold
+        if price >= nearest_resistance:
+            # Price is at or above resistance
+            distance_factor = min(
+                1.0, abs(price - nearest_resistance) / (price * sell_threshold)
             )
-            sell_signal_strength = max(0.0, proximity * 0.8)  # Scale to 0.0-0.8
+            sell_signal_strength = 1.0 - (distance_factor * 0.5)
+        elif price >= nearest_resistance * (1 - sell_threshold):
+            # Price is within threshold of resistance
+            proximity = (price - nearest_resistance * (1 - sell_threshold)) / (
+                nearest_resistance * sell_threshold
+            )
+            sell_signal_strength = max(0.0, proximity * 0.8)
 
         return buy_signal_strength, sell_signal_strength
 
