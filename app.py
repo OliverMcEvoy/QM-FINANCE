@@ -8,10 +8,7 @@ import numpy as np
 
 # --- Import local modules ---
 from utils.data_fetcher import get_stock_data
-from strategies.quantum_momentum import QuantumMomentumStrategy  # Import the strategy
-from strategies.better_quantum import (
-    CustomQuantumStrategy,
-)  # Import the custom strategy
+from strategies.better_quantum import CustomQuantumStrategy
 
 # --- Streamlit App Configuration ---
 st.set_page_config(layout="wide")
@@ -38,36 +35,7 @@ SelectedStrategy = available_strategies[strategy_name]
 # Strategy-specific parameters
 st.sidebar.subheader(f"{strategy_name} Parameters")
 strategy_params = {}
-
-if strategy_name == "QuantumMomentum":
-    sma_period = st.sidebar.slider("SMA Period", 5, 50, 10)
-    prob_threshold = st.sidebar.slider("Probability Threshold", 0.5, 0.95, 0.6, 0.01)
-    entanglement_lookback = st.sidebar.slider("Entanglement Lookback", 5, 50, 20)
-
-    # For phase periods, we'll use a multiselect with default values
-    phase_period_options = list(range(5, 51, 5))
-    default_phases = [5, 10, 20]
-    phase_periods = st.sidebar.multiselect(
-        "Phase Periods", options=phase_period_options, default=default_phases
-    )
-
-    interference_weight = st.sidebar.slider("Interference Weight", 0.0, 1.0, 0.5, 0.05)
-    uncertainty_factor = st.sidebar.slider("Uncertainty Factor", 0.0, 1.0, 0.2, 0.05)
-    tunneling_threshold = st.sidebar.slider("Tunneling Threshold", 0.5, 5.0, 2.0, 0.1)
-    superposition_count = st.sidebar.slider("Superposition Count", 1, 10, 3, 1)
-
-    strategy_params = {
-        "sma_period": sma_period,
-        "prob_threshold": prob_threshold,
-        "entanglement_lookback": entanglement_lookback,
-        "phase_periods": phase_periods,
-        "interference_weight": interference_weight,
-        "uncertainty_factor": uncertainty_factor,
-        "tunneling_threshold": tunneling_threshold,
-        "superposition_count": superposition_count,
-    }
-
-elif strategy_name == "CustomQuantum":
+if strategy_name == "CustomQuantum":
     sma_period = st.sidebar.slider("SMA Period", 5, 50, 10)
     prob_threshold = st.sidebar.slider("Probability Threshold", 0.5, 0.95, 0.6, 0.01)
     quantum_factor = st.sidebar.slider("Quantum Factor", 0.1, 1.0, 0.5, 0.05)
