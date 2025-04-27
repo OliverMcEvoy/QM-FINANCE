@@ -53,11 +53,27 @@ class CustomQuantumStrategy(bt.Strategy):
         ),
         # Variable sizing parameter
         ("max_position_pct", 0.95),  # Max % of cash to use on a max strength buy signal
+        # Initial state parameters
+        ("initial_smoothed_eigenvalues", None),
+        ("initial_potential_wells", None),
+        ("initial_quantum_state", None),
+        # Control trading execution
+        ("trading_enabled", True),  # <<< ADDED PARAMETER
     )
 
     def __init__(self, *args, **kwargs):
         # ...existing code...
         super().__init__(*args, **kwargs)
+        # apply initial state if provided
+        if self.p.initial_smoothed_eigenvalues is not None:
+            self.smoothed_eigenvalues = list(self.p.initial_smoothed_eigenvalues)
+        if self.p.initial_potential_wells is not None:
+            self.potential_wells = [
+                well.copy() for well in self.p.initial_potential_wells
+            ]
+        if self.p.initial_quantum_state is not None:
+            self.quantum_state = np.array(self.p.initial_quantum_state)
+
         # Trade tracking (now storing dollar amounts)
         self.buy_signals = []  # Stores (datetime, price, buy_value)
         self.sell_signals = []  # Stores (datetime, price, sell_value)
@@ -68,7 +84,9 @@ class CustomQuantumStrategy(bt.Strategy):
         self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
 
         # Quantum state (simplified)
-        self.quantum_state = np.array([0.5, 0.5])  # Initial 50/50 state
+        # Initialize quantum state only if not provided
+        if self.p.initial_quantum_state is None:  # <<< MODIFIED INITIALIZATION
+            self.quantum_state = np.array([0.5, 0.5])  # Initial 50/50 state
 
         # Wavefunction storage
         self.wavefunction_data = []
@@ -79,12 +97,16 @@ class CustomQuantumStrategy(bt.Strategy):
         self.eigenvalues = []
         self.hamiltonian_data = []
         self.last_hamiltonian = None
-        self.smoothed_eigenvalues = None  # For storing time-smoothed eigenvalues
+        # Initialize smoothed_eigenvalues only if not provided
+        if self.p.initial_smoothed_eigenvalues is None:  # <<< MODIFIED INITIALIZATION
+            self.smoothed_eigenvalues = None  # For storing time-smoothed eigenvalues
 
         # Time evolution tracking - create with default values
         self.eigenvalue_history = []  # Track eigenvalues over time
         self.time_evolution_matrix = None  # Time evolution operator
-        self.potential_wells = []  # Dynamic potential wells
+        # Initialize potential_wells only if not provided
+        if self.p.initial_potential_wells is None:  # <<< MODIFIED INITIALIZATION
+            self.potential_wells = []  # Dynamic potential wells
         self.price_memory = []  # Store price history with decaying importance
 
         # Initialize default eigenvalues based on params
@@ -243,57 +265,63 @@ class CustomQuantumStrategy(bt.Strategy):
             (dt, eigenvalue_buy_signal, eigenvalue_sell_signal)
         )
 
-        # 5. TRADING DECISION
-        if not self.position:  # Not in market
-            if final_buy_prob > self.p.prob_threshold:
-                # --- MODIFIED BUY SIZING ---
-                # Always use the maximum allowed percentage of cash
-                available_cash = self.broker.getcash()
-                cash_to_use = (
-                    available_cash * self.p.max_position_pct
-                )  # Use max allowed cash
+        # 5. TRADING DECISION - Only if trading is enabled
+        if self.p.trading_enabled:  # <<< ADDED CHECK
+            if not self.position:  # Not in market
+                if final_buy_prob > self.p.prob_threshold:
+                    # --- MODIFIED BUY SIZING ---
+                    # Always use the maximum allowed percentage of cash
+                    available_cash = self.broker.getcash()
+                    cash_to_use = (
+                        available_cash * self.p.max_position_pct
+                    )  # Use max allowed cash
 
-                # Calculate shares and actual buy value
-                shares = int(cash_to_use / price)
-                if shares > 0:
-                    buy_value = shares * price
-                    self.buy(size=shares)
-                    self.buy_signals.append((dt, price, buy_value))  # Store buy value
-                    self.current_trade = {
-                        "buy_date": dt,
-                        "buy_price": price,
-                        "shares": shares,
-                        "buy_value": buy_value,  # Store buy value in trade log
-                    }
-                # --- END MODIFIED BUY SIZING ---
-        else:  # In market
-            if final_sell_prob > self.p.prob_threshold:
-                # Calculate sell value (based on current position size)
-                sell_value = self.position.size * price
-                # Sell all shares (already closes the entire position)
-                self.close()
-                self.sell_signals.append((dt, price, sell_value))  # Store sell value
-
-                # Record trade
-                if self.current_trade:
-                    pnl = price - self.current_trade["buy_price"]
-                    total_pnl = pnl * self.current_trade["shares"]
-                    self.trades.append(
-                        {
-                            "buy_date": self.current_trade["buy_date"],
-                            "buy_price": self.current_trade["buy_price"],
-                            "buy_value": self.current_trade[
-                                "buy_value"
-                            ],  # Add buy value
-                            "sell_date": dt,
-                            "sell_price": price,
-                            "sell_value": sell_value,  # Add sell value
-                            "shares": self.current_trade["shares"],
-                            "total_pnl": total_pnl,
+                    # Calculate shares and actual buy value
+                    shares = int(cash_to_use / price)
+                    if shares > 0:
+                        buy_value = shares * price
+                        self.buy(size=shares)
+                        self.buy_signals.append(
+                            (dt, price, buy_value)
+                        )  # Store buy value
+                        self.current_trade = {
+                            "buy_date": dt,
+                            "buy_price": price,
+                            "shares": shares,
+                            "buy_value": buy_value,  # Store buy value in trade log
                         }
-                    )
-                    self.current_trade = None
+                    # --- END MODIFIED BUY SIZING ---
+            else:  # In market
+                if final_sell_prob > self.p.prob_threshold:
+                    # Calculate sell value (based on current position size)
+                    sell_value = self.position.size * price
+                    # Sell all shares (already closes the entire position)
+                    self.close()
+                    self.sell_signals.append(
+                        (dt, price, sell_value)
+                    )  # Store sell value
 
+                    # Record trade
+                    if self.current_trade:
+                        pnl = price - self.current_trade["buy_price"]
+                        total_pnl = pnl * self.current_trade["shares"]
+                        self.trades.append(
+                            {
+                                "buy_date": self.current_trade["buy_date"],
+                                "buy_price": self.current_trade["buy_price"],
+                                "buy_value": self.current_trade[
+                                    "buy_value"
+                                ],  # Add buy value
+                                "sell_date": dt,
+                                "sell_price": price,
+                                "sell_value": sell_value,  # Add sell value
+                                "shares": self.current_trade["shares"],
+                                "total_pnl": total_pnl,
+                            }
+                        )
+                        self.current_trade = None
+
+    # ... rest of the methods (_evaluate_eigenvalue_signals, _calculate_phase, etc.) remain unchanged ...
     def _evaluate_eigenvalue_signals(self, price, eigenvalues):
         """
         Generate buy/sell signals based on price position relative to eigenvalues
