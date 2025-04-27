@@ -5,3 +5,6 @@ numpy
 yfinance
 matplotlib
 scipy
+plotly
+plotly_express
+plotly.graph_objects

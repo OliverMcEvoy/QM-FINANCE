@@ -46,24 +46,27 @@ class StockScreener:
         market_data = get_stock_data(index_ticker, start_date, end_date)
         if market_data is not None and "Close" in market_data:
             idx_ret = market_data["Close"].pct_change().dropna()
-            # use mean return over last 20 days as market_trend
             market_trend = float(idx_ret[-20:].mean()) if len(idx_ret) >= 5 else 0.0
         else:
             market_trend = 0.0
+
+        # Prefetch data for each ticker sequentially to avoid caching race conditions
+        data_map = {}
+        for ticker in tickers:
+            data_map[ticker] = get_stock_data(
+                ticker,
+                start_date,
+                end_date,
+                use_cache=not force_refresh,
+                cache_dir=self.cache_dir,
+            )
 
         # Worker to fetch and analyze one ticker
         def process_ticker(ticker):
             # fresh analyzer per thread to avoid shared state
             analyzer = EigenvalueAnalyzer(params=self.analyzer.params.copy())
-            # Try to load cached data first
-            data = self._load_cached_data(ticker) if not force_refresh else None
-            if data is not None and data.index[0].date() > start_date.date():
-                data = None
-            if data is None:
-                # If no cached data or force_refresh, fetch new data
-                data = get_stock_data(ticker, start_date, end_date)
-                if data is not None:
-                    self._cache_data(ticker, data)
+            # Use prefetched data
+            data = data_map.get(ticker)
             if data is None:
                 return None
             # Analyze the stock
@@ -104,20 +107,3 @@ class StockScreener:
             )
             return ranked_results
         return []
-
-    def _cache_data(self, ticker, data):
-        """Save data to cache"""
-        cache_file = os.path.join(self.cache_dir, f"{ticker}.pkl")
-        with open(cache_file, "wb") as f:
-            pickle.dump({"data": data, "timestamp": datetime.now()}, f)
-
-    def _load_cached_data(self, ticker):
-        """Load data from cache if fresh enough"""
-        cache_file = os.path.join(self.cache_dir, f"{ticker}.pkl")
-        if os.path.exists(cache_file):
-            with open(cache_file, "rb") as f:
-                cached = pickle.load(f)
-                # Check if cache is fresh (less than 1 day old)
-                if datetime.now() - cached["timestamp"] < timedelta(days=1):
-                    return cached["data"]
-        return None

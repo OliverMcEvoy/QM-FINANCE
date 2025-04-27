@@ -250,6 +250,19 @@ class EigenvalueAnalyzer:
                         price_data.index[i - 1]
                     )  # Use the date at the end of the window
 
+        # Ensure final data point is included (last week of trading)
+        # Use window ending at last data point
+        final_idx = total_points
+        last_date = price_data.index[-1]
+        if not all_dates or all_dates[-1] != last_date:
+            price_window = price_data["Close"].values[-wf_lookback:]
+            hamiltonian = self._calculate_hamiltonian(price_window)
+            if hamiltonian is not None:
+                eigenvalues, _ = self._calculate_eigenvalues(hamiltonian, price_window)
+                if eigenvalues:
+                    eigenvalue_history.append(eigenvalues)
+                    all_dates.append(last_date)
+
         return eigenvalue_history, all_dates
 
     def _calculate_hamiltonian(self, price_history):

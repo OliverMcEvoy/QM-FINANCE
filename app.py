@@ -8,6 +8,8 @@ import yfinance as yf
 from matplotlib.dates import DateFormatter
 import matplotlib as mpl
 import json
+import plotly.graph_objects as go
+import plotly.express as px
 
 from utils.stock_screener import StockScreener
 from utils.eigenvalue_analyzer import EigenvalueAnalyzer
@@ -45,6 +47,8 @@ DEFAULT_TICKERS = [
 # File to store user's preferred ticker list
 SAVED_TICKERS_FILE = "data/saved_tickers.json"
 CACHE_DIR = "data/cache"
+# Define market trend tickers list for cache management and plotting
+MARKET_TICKERS = ["^GSPC", "^IXIC", "^DJI", "^FTSE", "^GDAXI", "^SOX", "GLD", "SLV"]
 
 # Ensure directories exist
 os.makedirs(os.path.dirname(SAVED_TICKERS_FILE), exist_ok=True)
@@ -110,6 +114,17 @@ st.sidebar.subheader("Cache Control")
 if st.sidebar.button("Clear Cached Stock Data"):
     files_removed = clear_cache()
     st.sidebar.success(f"Cleared {files_removed} cached stock files")
+if st.sidebar.button("Clear Market Trends Cache"):
+    removed = 0
+    for filename in os.listdir(CACHE_DIR):
+        for ticker in MARKET_TICKERS:
+            if filename.startswith(ticker):
+                try:
+                    os.remove(os.path.join(CACHE_DIR, filename))
+                    removed += 1
+                except Exception:
+                    pass
+    st.sidebar.success(f"Cleared {removed} market trends cache files")
 
 # User stock list management
 st.sidebar.subheader("Manage Your Stock List")
@@ -147,7 +162,7 @@ if ticker_source == "Custom Input":
     )
 
 # Replace lookback days with date selection
-default_start_date = datetime.now() - timedelta(days=3650)
+default_start_date = datetime.now() - timedelta(days=5000)
 start_date = st.sidebar.date_input(
     "Start Date",
     value=default_start_date,
@@ -170,9 +185,87 @@ eigenvalue_sell_threshold = st.sidebar.slider(
 
 # Run button
 run_button = st.sidebar.button("Run Screener")
+# Button to generate market trends on demand
+generate_trends = st.sidebar.button("Generate Market Trends")
 
 # --- Create Tabs ---
 tab1, tab2, tab3 = st.tabs(["Screener Results", "About & Mathematics", "Market Trends"])
+
+with tab3:
+    # Only generate trends when requested
+    if generate_trends:
+        st.header("General Market & Sector Trends")
+        # Define market indices and commodities for analysis
+        index_map = {
+            "S&P 500": "^GSPC",
+            "Nasdaq Composite": "^IXIC",
+            "Dow Jones": "^DJI",
+            "FTSE 100": "^FTSE",
+            "DAX": "^GDAXI",
+            "Semiconductor Index": "^SOX",
+            "Gold ETF (GLD)": "GLD",
+            "Silver ETF (SLV)": "SLV",
+        }
+        chart_start = datetime.combine(start_date, datetime.min.time())
+        chart_end = datetime.now()
+        # Loop through each market series and apply eigenvalue analysis
+        for name, ticker in index_map.items():
+            data = get_stock_data(ticker, chart_start, chart_end)
+            if data is not None and "Close" in data and not data["Close"].empty:
+                # Initialize analyzer with user-selected eigenvalue count
+                analyzer = EigenvalueAnalyzer(
+                    params={"eigenvalue_count": eigenvalue_count}
+                )
+                analysis = analyzer.analyze_stock(data)
+
+                if analysis and analysis.get("eigenvalue_history"):
+                    # Interactive Plotly chart for market trends
+                    ev_dates = analysis["dates"]
+                    ev_history = analysis["eigenvalue_history"]
+                    fig = go.Figure()
+                    # Price trace
+                    fig.add_trace(
+                        go.Scatter(
+                            x=data.index,
+                            y=data["Close"],
+                            mode="lines",
+                            name="Close Price",
+                            line=dict(color="#00BFFF", width=2),
+                        )
+                    )
+                    # Eigenvalue level traces
+                    num_levels = len(ev_history[0])
+                    palette = px.colors.sequential.Plasma
+                    for j in range(num_levels):
+                        level_series = [ev[j] for ev in ev_history]
+                        color = palette[
+                            int(j * (len(palette) - 1) / max(1, num_levels - 1))
+                        ]
+                        fig.add_trace(
+                            go.Scatter(
+                                x=ev_dates,
+                                y=level_series,
+                                mode="lines",
+                                name=f"Level {j+1}",
+                                line=dict(dash="dash", color=color, width=1.5),
+                            )
+                        )
+                    # Layout customization
+                    fig.update_layout(
+                        template="plotly_dark",
+                        title=f"{name} - Eigenvalue Analysis",
+                        xaxis_title="Date",
+                        yaxis_title="Price ($)",
+                        legend=dict(bgcolor="rgba(0,0,0,0.3)"),
+                        margin=dict(l=40, r=20, t=60, b=40),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.write(f"No eigenvalue data available for {name}")
+            else:
+                st.write(f"Data unavailable for {name}")
+    else:
+        st.info("Click 'Generate Market Trends' in the sidebar to load trends.")
 
 with tab1:
     st.header("Stock Ranking by Risk-Adjusted Momentum")  # Update header
@@ -245,101 +338,88 @@ with tab1:
             for i, stock in enumerate(top_stocks):
                 st.markdown(f"### {stock['ticker']}")
 
-                # Create visualization of price and evolving eigenvalues - full width
-                fig, ax = plt.subplots(
-                    figsize=(20, 8)
-                )  # Much wider figure for full screen width
-
-                # Get data for this stock to plot
-                ticker_data = screener._load_cached_data(stock["ticker"])
-
+                # Build interactive Plotly chart for detailed analysis
+                # Prepare data
+                ticker_data = get_stock_data(
+                    stock["ticker"],
+                    start_datetime,
+                    datetime.now(),
+                    use_cache=True,
+                    cache_dir=CACHE_DIR,
+                )
                 if (
                     ticker_data is not None
                     and "eigenvalue_history" in stock
                     and "dates" in stock
+                    and stock["eigenvalue_history"]
                 ):
-                    # Get the subset of price data that aligns with eigenvalue history
-                    if len(stock["eigenvalue_history"]) > 0:
-                        # Plot price history - show more data points for longer history
-                        display_window = len(ticker_data)
-                        date_subset = ticker_data.index[-display_window:]
-                        price_subset = ticker_data["Close"].values[-display_window:]
-
-                        # Plot price with enhanced styling
-                        ax.plot(
-                            date_subset,
-                            price_subset,
-                            label="Price",
-                            color="#00BFFF",
-                            linewidth=2.5,
+                    display_window = len(ticker_data)
+                    date_subset = ticker_data.index[-display_window:]
+                    price_subset = ticker_data["Close"].values[-display_window:]
+                    ev_dates = stock["dates"][
+                        -min(display_window, len(stock["dates"])) :
+                    ]
+                    ev_history = stock["eigenvalue_history"][
+                        -min(display_window, len(stock["eigenvalue_history"])) :
+                    ]
+                    # Create Plotly figure
+                    fig = go.Figure()
+                    # Price trace
+                    fig.add_trace(
+                        go.Scatter(
+                            x=date_subset,
+                            y=price_subset,
+                            mode="lines",
+                            name="Price",
+                            line=dict(color="#00BFFF", width=2.5),
                         )
-
-                        # Get eigenvalue data
-                        ev_dates = stock["dates"][
-                            -min(display_window, len(stock["dates"])) :
+                    )
+                    # Eigenvalue level traces
+                    num_ev = len(ev_history[0])
+                    palette = px.colors.sequential.Plasma
+                    for j in range(num_ev):
+                        series_j = [ev[j] for ev in ev_history]
+                        color = palette[
+                            int(j * (len(palette) - 1) / max(1, num_ev - 1))
                         ]
-                        ev_history = stock["eigenvalue_history"][
-                            -min(display_window, len(stock["eigenvalue_history"])) :
-                        ]
-
-                        # Plot evolving eigenvalues over time
-                        if len(ev_history) > 0:
-                            num_eigenvalues = len(ev_history[0])
-                            colors = plt.cm.plasma(np.linspace(0, 1, num_eigenvalues))
-
-                            # For each eigenvalue level (e.g., support/resistance)
-                            for j in range(num_eigenvalues):
-                                # Extract this eigenvalue's evolution over time
-                                eigenvalue_series = [ev[j] for ev in ev_history]
-                                ax.plot(
-                                    ev_dates,
-                                    eigenvalue_series,
-                                    "--",
-                                    color=colors[j],
-                                    alpha=0.85,
-                                    linewidth=1.8,
-                                    label=f"Level {j+1}",
-                                )
-
-                        # Mark current price with more visible marker
-                        ax.scatter(
-                            [ticker_data.index[-1]],
-                            [stock["current_price"]],
-                            color="white",
-                            edgecolor="#00FF7F",
-                            s=180,
-                            zorder=5,
-                            marker="o",
-                            linewidth=2.5,
+                        fig.add_trace(
+                            go.Scatter(
+                                x=ev_dates,
+                                y=series_j,
+                                mode="lines",
+                                name=f"Level {j+1}",
+                                line=dict(dash="dash", color=color, width=1.8),
+                            )
                         )
-
-                        # Format dates on x-axis
-                        ax.xaxis.set_major_formatter(DateFormatter("%b %d %Y"))
-                        plt.xticks(rotation=45)
-
-                        # Add grid for better readability
-                        ax.grid(True, linestyle="--", alpha=0.3)
-
-                        # Add title and labels
-                        ax.set_title(
-                            f"{stock['ticker']} - Eigenvalue Analysis",
-                            color="white",
-                            fontsize=16,
-                            pad=20,
+                    # Current price marker
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[date_subset[-1]],
+                            y=[stock["current_price"]],
+                            mode="markers",
+                            name="Current Price",
+                            marker=dict(
+                                color="white",
+                                size=12,
+                                line=dict(color="#00FF7F", width=2.5),
+                            ),
                         )
-                        ax.set_ylabel("Price ($)", color="white", fontsize=12)
-
-                        # Add legend with transparent background
-                        legend = ax.legend(
-                            loc="upper left", framealpha=0.3, fontsize=12
-                        )
-                        plt.setp(legend.get_texts(), color="white")
-
-                        # Make sure everything fits
-                        plt.tight_layout()
-
-                        # Display the full-width chart
-                        st.pyplot(fig)
+                    )
+                    # Layout
+                    fig.update_layout(
+                        template="plotly_dark",
+                        title=dict(
+                            text=f"{stock['ticker']} - Eigenvalue Analysis",
+                            font=dict(color="white", size=16),
+                        ),
+                        xaxis=dict(title="Date"),
+                        yaxis=dict(title="Price ($)"),
+                        legend=dict(bgcolor="rgba(0,0,0,0.3)"),
+                        margin=dict(l=40, r=20, t=60, b=40),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.write("No data available for chart")
 
                 # Show key metrics in 4 columns for better layout
                 metrics_cols = st.columns(4)
@@ -400,71 +480,73 @@ with tab1:
                     st.metric("Buy Signal", f"{stock['buy_signal']:.2f}")
                     st.metric("Sell Signal", f"{stock['sell_signal']:.2f}")
 
-                    # Create small chart showing price and eigenvalues
-                    fig, ax = plt.subplots(
-                        figsize=(6, 4)
-                    )  # Keep smaller size for columns
-
-                    # Get data for this stock
-                    ticker_data = screener._load_cached_data(stock["ticker"])
-
+                    # Build interactive Plotly chart for small column
+                    ticker_data = get_stock_data(
+                        stock["ticker"],
+                        start_datetime,
+                        datetime.now(),
+                        use_cache=True,
+                        cache_dir=CACHE_DIR,
+                    )
                     if ticker_data is not None and len(ticker_data) > 0:
-                        # Plot recent price history (last 60 days)
                         display_window = min(60, len(ticker_data))
                         date_subset = ticker_data.index[-display_window:]
                         price_subset = ticker_data["Close"].values[-display_window:]
-
-                        # Plot price with consistent styling
-                        ax.plot(
-                            date_subset,
-                            price_subset,
-                            label="Price",
-                            color="#00BFFF",  # Match top stock color
-                            linewidth=2.0,  # Slightly thinner for smaller chart
+                        # Create Plotly figure
+                        small_fig = go.Figure()
+                        # Price trace
+                        small_fig.add_trace(
+                            go.Scatter(
+                                x=date_subset,
+                                y=price_subset,
+                                mode="lines",
+                                name="Price",
+                                line=dict(color="#00BFFF", width=2),
+                            )
                         )
-
-                        # Add current eigenvalues as horizontal lines with consistent styling
+                        # Eigenvalue levels
                         if "eigenvalues" in stock and stock["eigenvalues"]:
-                            num_eigenvalues = len(stock["eigenvalues"])
-                            colors = plt.cm.plasma(np.linspace(0, 1, num_eigenvalues))
-                            for j, eigenvalue in enumerate(
-                                sorted(stock["eigenvalues"])
-                            ):  # Sort for consistent coloring order
-                                ax.axhline(
-                                    y=eigenvalue,
-                                    linestyle="--",
-                                    color=colors[j],
-                                    alpha=0.85,  # Match top stock alpha
-                                    linewidth=1.5,  # Slightly thinner
-                                    label=(
-                                        f"Level {j+1}" if i == 0 else ""
-                                    ),  # Only label once per column set potentially
+                            palette = px.colors.sequential.Plasma
+                            for j, eigen in enumerate(sorted(stock["eigenvalues"])):
+                                color = palette[
+                                    int(
+                                        j
+                                        * (len(palette) - 1)
+                                        / max(1, len(stock["eigenvalues"]) - 1)
+                                    )
+                                ]
+                                small_fig.add_trace(
+                                    go.Scatter(
+                                        x=[date_subset[0], date_subset[-1]],
+                                        y=[eigen, eigen],
+                                        mode="lines",
+                                        name=f"Level {j+1}",
+                                        line=dict(dash="dash", color=color, width=1.5),
+                                    )
                                 )
-
-                        # Mark current price with consistent marker
-                        ax.scatter(
-                            [date_subset[-1]],
-                            [stock["current_price"]],
-                            color="white",
-                            edgecolor="#00FF7F",
-                            s=100,  # Smaller marker size
-                            zorder=5,
-                            marker="o",
-                            linewidth=2.0,  # Match top stock linewidth
+                        # Current price marker
+                        small_fig.add_trace(
+                            go.Scatter(
+                                x=[date_subset[-1]],
+                                y=[stock["current_price"]],
+                                mode="markers",
+                                name="Current Price",
+                                marker=dict(
+                                    color="white",
+                                    size=8,
+                                    line=dict(color="#00FF7F", width=2),
+                                ),
+                            )
                         )
-
-                        # Format the chart consistently
-                        ax.set_title(
-                            f"{stock['ticker']} Recent Price",
-                            color="white",
-                            fontsize=12,
+                        # Layout
+                        small_fig.update_layout(
+                            title=f"{stock['ticker']} Recent Price",
+                            template="plotly_dark",
+                            margin=dict(l=20, r=20, t=30, b=20),
+                            xaxis=dict(showgrid=True),
+                            yaxis=dict(showgrid=True),
                         )
-                        ax.xaxis.set_major_formatter(DateFormatter("%m-%d"))
-                        plt.xticks(rotation=45)
-                        ax.grid(True, linestyle="--", alpha=0.3)  # Match top stock grid
-                        plt.tight_layout()
-
-                        st.pyplot(fig)
+                        st.plotly_chart(small_fig, use_container_width=True)
                     else:
                         st.write("No data available for chart")
 
@@ -631,71 +713,3 @@ with tab2:
         This tool utilizes mathematical models inspired by physics for market analysis. It is **not** financial advice. All trading involves significant risk. Perform your own due diligence before making any investment decisions.
         """
     )
-
-with tab3:
-    st.header("General Market & Sector Trends")
-    # Define market indices and commodities for analysis
-    index_map = {
-        "S&P 500": "^GSPC",
-        "Nasdaq Composite": "^IXIC",
-        "Dow Jones": "^DJI",
-        "FTSE 100": "^FTSE",
-        "DAX": "^GDAXI",
-        "Semiconductor Index": "^SOX",
-        "Gold ETF (GLD)": "GLD",
-        "Silver ETF (SLV)": "SLV",
-    }
-    chart_start = datetime.combine(start_date, datetime.min.time())
-    chart_end = datetime.now()
-
-    # Loop through each market series and apply eigenvalue analysis
-    for name, ticker in index_map.items():
-        data = get_stock_data(ticker, chart_start, chart_end)
-        if data is not None and "Close" in data and not data["Close"].empty:
-            # Initialize analyzer with user-selected eigenvalue count
-            analyzer = EigenvalueAnalyzer(params={"eigenvalue_count": eigenvalue_count})
-            analysis = analyzer.analyze_stock(data)
-
-            if analysis and analysis.get("eigenvalue_history"):
-                fig, ax = plt.subplots(figsize=(12, 6))
-                # Plot price history
-                ax.plot(
-                    data.index,
-                    data["Close"],
-                    label="Close Price",
-                    color="#00BFFF",
-                    linewidth=2,
-                )
-
-                # Plot evolving eigenvalue levels
-                dates = analysis["dates"]
-                ev_history = analysis["eigenvalue_history"]
-                num_levels = len(ev_history[0])
-                colors = plt.cm.plasma(np.linspace(0, 1, num_levels))
-                for j in range(num_levels):
-                    series_j = [ev[j] for ev in ev_history]
-                    ax.plot(
-                        dates,
-                        series_j,
-                        "--",
-                        color=colors[j],
-                        alpha=0.8,
-                        linewidth=1.5,
-                        label=f"Level {j+1}",
-                    )
-
-                # Formatting
-                ax.set_title(
-                    f"{name} - Eigenvalue Analysis", color="white", fontsize=14
-                )
-                ax.xaxis.set_major_formatter(DateFormatter("%b %d %Y"))
-                plt.xticks(rotation=45)
-                ax.grid(True, linestyle="--", alpha=0.3)
-                legend = ax.legend(loc="upper left", framealpha=0.3)
-                plt.setp(legend.get_texts(), color="white")
-                plt.tight_layout()
-                st.pyplot(fig)
-            else:
-                st.write(f"No eigenvalue data available for {name}")
-        else:
-            st.write(f"Data unavailable for {name}")
