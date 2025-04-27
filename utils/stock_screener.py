@@ -77,12 +77,17 @@ class StockScreener:
                     self.analyzer.params["sr_lookback"] = orig_sr_lookback
 
                 if analysis:
+                    # Ensure the new metric exists, default to 0 if not
+                    if "risk_adjusted_momentum" not in analysis:
+                        analysis["risk_adjusted_momentum"] = 0.0
                     results.append(analysis)
 
-        # Rank results by breakout potential
+        # Rank results by the new risk-adjusted momentum score
         if results:
             ranked_results = sorted(
-                results, key=lambda x: x["breakout_potential"], reverse=True
+                results,
+                key=lambda x: x["risk_adjusted_momentum"],
+                reverse=True,  # Rank by new metric
             )
             return ranked_results
         return []

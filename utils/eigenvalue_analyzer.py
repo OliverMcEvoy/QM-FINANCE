@@ -24,57 +24,163 @@ class EigenvalueAnalyzer:
         self.time_evolution_matrix = None
         self.eigenvalue_history = []
 
+    def _calculate_risk_adjusted_momentum(
+        self,
+        current_price,
+        eigenvalues,
+        price_history,
+        buy_signal,
+        sell_signal,
+        support_level,
+        resistance_level,
+        distance_to_nearest,
+    ):
+        """Calculate a risk-adjusted momentum score."""
+        if not eigenvalues or len(eigenvalues) == 0 or current_price == 0:
+            return 0.0
+
+        # Momentum component
+        momentum = buy_signal - sell_signal
+
+        # Risk component (normalized distance to nearest level) - lower is riskier
+        # We use the raw distance here, not percentage
+        risk = (distance_to_nearest / current_price) if current_price else 0.0
+
+        # Volatility component (using recent price history)
+        lookback = min(20, len(price_history))
+        if lookback < 5:
+            volatility = 0.0
+        else:
+            recent_prices = price_history[-lookback:]
+            mean_recent = np.mean(recent_prices)
+            std_recent = np.std(recent_prices)
+            volatility = (std_recent / mean_recent) if mean_recent else 0.0
+
+        # Eigenvalue spread component (normalized)
+        eigenvalue_spread = (
+            ((resistance_level - support_level) / current_price)
+            if current_price
+            else 0.0
+        )
+
+        # Combine components
+        # We want high momentum, low risk (being far from levels is less risky for momentum),
+        # wider spread (more room to move), adjusted by volatility.
+        # Formula: Momentum * (1 + Risk) * Eigenvalue_Spread / (1 + Volatility)
+        # Using (1+Risk) because higher distance (lower risk) should amplify momentum score.
+        score = (
+            momentum
+            * (1 + risk * 5)  # Amplify effect of distance
+            * (1 + eigenvalue_spread)  # Amplify effect of spread
+            / (1 + volatility * 2)  # Dampen score by volatility
+        )
+
+        # Normalize roughly (can exceed +/- 1 but centers around 0)
+        return np.tanh(score)  # Use tanh to keep score bounded (-1 to 1)
+
     def analyze_stock(self, price_data):
         """Analyze a stock's price history and return eigenvalue metrics"""
-        if len(price_data) < self.params["sr_lookback"]:
+        if len(price_data) < max(
+            self.params["sr_lookback"], self.params["wf_lookback"]
+        ):  # Ensure enough data for both lookbacks
             return None
 
         close_prices = price_data["Close"].values
         current_price = close_prices[-1]
 
-        # Calculate eignevalues over time
+        # Calculate eigenvalues over time
         eigenvalue_history, dates = self._calculate_eigenvalue_history(price_data)
 
-        # Get latest eigenvalues
-        if eigenvalue_history and len(eigenvalue_history) > 0:
-            eigenvalues = eigenvalue_history[-1]
-        else:
+        if not eigenvalue_history or len(eigenvalue_history) == 0:
             return None
 
-        # Analyze price position relative to eigenvalues
+        # Use the latest set of eigenvalues
+        current_eigenvalues = eigenvalue_history[-1]
+        if not current_eigenvalues or len(current_eigenvalues) == 0:
+            return None  # No eigenvalues calculated for the latest point
+
+        # --- New Support/Resistance Logic ---
+        sorted_eigenvalues = sorted(
+            list(set(current_eigenvalues))
+        )  # Ensure sorted unique values
+        n_eigenvalues = len(sorted_eigenvalues)
+
+        if n_eigenvalues == 0:
+            return None  # Should not happen if check above passed, but safety first
+
+        # Determine Support Level based on user's definition
+        support_candidates_below = [e for e in sorted_eigenvalues if e < current_price]
+        if support_candidates_below:
+            support_level = max(support_candidates_below)
+        else:
+            # No eigenvalues strictly below price. Find the lowest one strictly above.
+            support_candidates_above = [
+                e for e in sorted_eigenvalues if e > current_price
+            ]
+            if support_candidates_above:
+                support_level = min(support_candidates_above)
+            else:
+                # Price might be equal to all, or outside range. Fallback to lowest.
+                support_level = sorted_eigenvalues[0]
+
+        # Determine Resistance Level based on user's definition
+        resistance_candidates_above_support = [
+            e for e in sorted_eigenvalues if e > support_level
+        ]
+        if resistance_candidates_above_support:
+            resistance_level = min(resistance_candidates_above_support)
+        else:
+            # Support level might be the highest eigenvalue. Fallback to highest.
+            resistance_level = sorted_eigenvalues[-1]
+            # Ensure resistance is not below support in edge cases
+            if resistance_level < support_level:
+                resistance_level = support_level
+        # --- End of New Support/Resistance Logic ---
+
+        # Calculate other metrics using original methods but potentially passing sorted eigenvalues
+        # Note: _evaluate_eigenvalue_signals and _calculate_breakout_potential have their own internal
+        # logic for finding relevant levels based on <= and >= which we keep for now.
         buy_signal, sell_signal = self._evaluate_eigenvalue_signals(
-            current_price, eigenvalues
+            current_price, sorted_eigenvalues
         )
 
-        # Calculate breakout potential
         breakout_potential = self._calculate_breakout_potential(
-            current_price, eigenvalues, close_prices
+            current_price, sorted_eigenvalues, close_prices
+        )
+
+        # Calculate distance to nearest using the standard definition (closest absolute distance)
+        raw_distance_to_nearest = self._distance_to_nearest_eigenvalue(
+            current_price, sorted_eigenvalues
+        )
+        percent_distance_to_nearest = (
+            (raw_distance_to_nearest / current_price * 100) if current_price else 0.0
+        )
+
+        # Calculate the risk-adjusted momentum using the NEWLY defined support/resistance levels
+        risk_adjusted_momentum = self._calculate_risk_adjusted_momentum(
+            current_price,
+            sorted_eigenvalues,  # Pass all eigenvalues for context if needed
+            close_prices,
+            buy_signal,  # Use signals from original method
+            sell_signal,  # Use signals from original method
+            support_level,  # Use NEW definition
+            resistance_level,  # Use NEW definition
+            raw_distance_to_nearest,  # Use standard distance definition for risk component
         )
 
         return {
             "ticker": price_data.name if hasattr(price_data, "name") else "",
             "current_price": current_price,
-            "eigenvalues": eigenvalues,
+            "eigenvalues": current_eigenvalues,  # Return original (potentially unsorted/non-unique) list from history
             "eigenvalue_history": eigenvalue_history,
             "dates": dates,
             "buy_signal": buy_signal,
             "sell_signal": sell_signal,
             "breakout_potential": breakout_potential,
-            "support_level": (
-                min(e for e in eigenvalues if e <= current_price)
-                if any(e <= current_price for e in eigenvalues)
-                else eigenvalues[0]
-            ),
-            "resistance_level": (
-                max(e for e in eigenvalues if e >= current_price)
-                if any(e >= current_price for e in eigenvalues)
-                else eigenvalues[-1]
-            ),
-            "distance_to_nearest": self._distance_to_nearest_eigenvalue(
-                current_price, eigenvalues
-            )
-            / current_price
-            * 100,  # as percentage
+            "support_level": support_level,  # Return NEW definition
+            "resistance_level": resistance_level,  # Return NEW definition
+            "distance_to_nearest": percent_distance_to_nearest,  # Return standard distance metric
+            "risk_adjusted_momentum": risk_adjusted_momentum,  # Calculated with NEW levels
         }
 
     def _calculate_eigenvalue_history(self, price_data):
