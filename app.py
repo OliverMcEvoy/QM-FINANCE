@@ -11,6 +11,7 @@ import json
 
 from utils.stock_screener import StockScreener
 from utils.eigenvalue_analyzer import EigenvalueAnalyzer
+from utils.data_fetcher import get_stock_data
 
 # Set default matplotlib style for all plots
 plt.style.use("dark_background")
@@ -171,7 +172,7 @@ eigenvalue_sell_threshold = st.sidebar.slider(
 run_button = st.sidebar.button("Run Screener")
 
 # --- Create Tabs ---
-tab1, tab2 = st.tabs(["Screener Results", "About & Mathematics"])
+tab1, tab2, tab3 = st.tabs(["Screener Results", "About & Mathematics", "Market Trends"])
 
 with tab1:
     st.header("Stock Ranking by Risk-Adjusted Momentum")  # Update header
@@ -221,7 +222,7 @@ with tab1:
                 table_data.append(
                     {
                         "Ticker": res["ticker"],
-                        "RiskAdj Momentum": f"{res.get('risk_adjusted_momentum', 0.0):.3f}",  # Add new metric
+                        "RiskAdj Momentum": f"{res.get('risk_adjusted_momentum', 0.0):.3f}",
                         "Current Price": f"${res['current_price']:.2f}",
                         "Buy Signal": f"{res['buy_signal']:.2f}",
                         "Sell Signal": f"{res['sell_signal']:.2f}",
@@ -229,6 +230,8 @@ with tab1:
                         "Nearest Support": f"${res['support_level']:.2f}",
                         "Nearest Resistance": f"${res['resistance_level']:.2f}",
                         "Dist to Level (%)": f"{res['distance_to_nearest']:.2f}%",
+                        "Sharpe Ratio": f"{res.get('sharpe_ratio', 0.0):.3f}",
+                        "Max Drawdown": f"{res.get('max_drawdown', 0.0):.3f}",
                     }
                 )
             df_results = pd.DataFrame(table_data)
@@ -364,6 +367,13 @@ with tab1:
                 with metrics_cols2[3]:
                     st.metric("Nearest Resistance", f"${stock['resistance_level']:.2f}")
 
+                # New performance metrics display
+                metrics_cols3 = st.columns(2)
+                with metrics_cols3[0]:
+                    st.metric("Sharpe Ratio", f"{stock.get('sharpe_ratio', 0.0):.3f}")
+                with metrics_cols3[1]:
+                    st.metric("Max Drawdown", f"{stock.get('max_drawdown', 0.0):.3f}")
+
                 st.markdown("---")  # Add separator between stocks
 
             # Get the bottom 3 stocks (lowest risk-adjusted momentum)
@@ -477,6 +487,13 @@ with tab2:
         interpreted as dynamic support and resistance levels.
 
         ---
+
+        ### Enhanced Eigenvalue Computation
+
+        • For larger Hamiltonian matrices (dim > 50), we leverage ARPACK's sparse solver (`scipy.sparse.linalg.eigsh`) with configurable tolerance and iteration limits to compute the lowest eigenvalues.
+        • Each computed eigenpair can be further refined via Rayleigh quotient iteration, sharpening accuracy at the cost of extra compute.
+        • All eigenvalue operations—including potential update and time evolution—run in parallel across symbols using Python's `concurrent.futures`.
+        • The Hamiltonian itself now includes a term influenced by recent overall market trend (e.g. S&P 500 mean return).
 
         ### 1. The Market Hamiltonian Operator ($\hat{H}$)
 
@@ -614,3 +631,31 @@ with tab2:
         This tool utilizes mathematical models inspired by physics for market analysis. It is **not** financial advice. All trading involves significant risk. Perform your own due diligence before making any investment decisions.
         """
     )
+
+with tab3:
+    st.header("General Market & Sector Trends")
+    # Fetch index data for S&P 500, Nasdaq, Dow
+    index_map = {"S&P 500": "^GSPC", "Nasdaq Composite": "^IXIC", "Dow Jones": "^DJI"}
+    # Use sidebar start date as chart start
+    chart_start = datetime.combine(start_date, datetime.min.time())
+    chart_end = datetime.now()
+    trend_series = {}
+    for name, idx in index_map.items():
+        idx_data = get_stock_data(idx, chart_start, chart_end)
+        if idx_data is not None and "Close" in idx_data:
+            trend_series[name] = idx_data["Close"]
+    if trend_series:
+        df_trends = pd.DataFrame(trend_series)
+        st.line_chart(df_trends)
+        # Show performance metrics
+        st.subheader("Index Performance")
+        perf = {}
+        for name, series in trend_series.items():
+            ret = series.pct_change().dropna()
+            perf[name] = {
+                "Total Return (%)": f"{(series.iloc[-1]/series.iloc[0]-1)*100:.2f}",
+                "Annualized Vol (%)": f"{ret.std()*np.sqrt(252)*100:.2f}",
+            }
+        st.dataframe(pd.DataFrame(perf).T)
+    else:
+        st.write("Market index data unavailable.")

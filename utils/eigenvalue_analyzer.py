@@ -1,13 +1,16 @@
 import numpy as np
 from scipy import linalg, fft
 import pandas as pd
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import eigsh
 
 
 class EigenvalueAnalyzer:
     """Core eigenvalue analysis for stock screening"""
 
     def __init__(self, params=None):
-        self.params = params or {
+        # include solver tuning and refinement parameters
+        default_params = {
             "potential_factor": 0.5,
             "kinetic_factor": 0.5,
             "eigenvalue_count": 5,
@@ -18,7 +21,16 @@ class EigenvalueAnalyzer:
             "eigenvalue_sell_threshold": 0.02,
             "time_evolution_rate": 0.2,
             "eigenvalue_persistence": 0.7,
+            # new solver/refinement settings
+            "eigen_solver_tol": 1e-8,
+            "eigen_solver_maxiter": 1000,
+            "eigen_refinement_iters": 3,
+            # market trend influence on Hamiltonian
+            "market_influence_factor": 0.1,
         }
+        self.params = {**default_params, **(params or {})}
+        # store latest market trend (e.g. S&P return)
+        self.market_trend = 0.0
         self.potential_wells = []
         self.smoothed_eigenvalues = None
         self.time_evolution_matrix = None
@@ -78,15 +90,19 @@ class EigenvalueAnalyzer:
         # Normalize roughly (can exceed +/- 1 but centers around 0)
         return np.tanh(score)  # Use tanh to keep score bounded (-1 to 1)
 
-    def analyze_stock(self, price_data):
+    def analyze_stock(self, price_data, market_trend=0.0):
         """Analyze a stock's price history and return eigenvalue metrics"""
+        # incorporate market trend for Hamiltonian adjustments
+        self.market_trend = market_trend
         if len(price_data) < max(
             self.params["sr_lookback"], self.params["wf_lookback"]
         ):  # Ensure enough data for both lookbacks
             return None
 
-        close_prices = price_data["Close"].values
-        current_price = close_prices[-1]
+        # Extract close prices as a clean 1D float array
+        close_prices = np.asarray(price_data["Close"].values, dtype=float).ravel()
+        # Current price as Python scalar
+        current_price = float(close_prices[-1])
 
         # Calculate eigenvalues over time
         eigenvalue_history, dates = self._calculate_eigenvalue_history(price_data)
@@ -94,8 +110,12 @@ class EigenvalueAnalyzer:
         if not eigenvalue_history or len(eigenvalue_history) == 0:
             return None
 
-        # Use the latest set of eigenvalues
+        # Use the latest set of eigenvalues and ensure scalar floats
         current_eigenvalues = eigenvalue_history[-1]
+        # Coerce any array-like entries to Python floats
+        current_eigenvalues = [
+            float(np.array(val).item()) for val in current_eigenvalues
+        ]
         if not current_eigenvalues or len(current_eigenvalues) == 0:
             return None  # No eigenvalues calculated for the latest point
 
@@ -168,6 +188,10 @@ class EigenvalueAnalyzer:
             raw_distance_to_nearest,  # Use standard distance definition for risk component
         )
 
+        # New performance metrics
+        sharpe_ratio = self._calculate_sharpe_ratio(close_prices)
+        max_drawdown = self._calculate_max_drawdown(close_prices)
+
         return {
             "ticker": price_data.name if hasattr(price_data, "name") else "",
             "current_price": current_price,
@@ -181,6 +205,9 @@ class EigenvalueAnalyzer:
             "resistance_level": resistance_level,  # Return NEW definition
             "distance_to_nearest": percent_distance_to_nearest,  # Return standard distance metric
             "risk_adjusted_momentum": risk_adjusted_momentum,  # Calculated with NEW levels
+            # New metrics
+            "sharpe_ratio": sharpe_ratio,
+            "max_drawdown": max_drawdown,
         }
 
     def _calculate_eigenvalue_history(self, price_data):
@@ -227,40 +254,50 @@ class EigenvalueAnalyzer:
 
     def _calculate_hamiltonian(self, price_history):
         """Calculate a time-dependent Hamiltonian based on price history"""
+        # Ensure price_history is a clean 1D float array and drop NaNs
+        price_history = np.asarray(price_history).astype(float).ravel()
+        # Remove any NaN entries (e.g., due to delisted or missing data)
+        price_history = price_history[~np.isnan(price_history)]
+
         lookback = min(len(price_history), self.params["wf_lookback"])
         if lookback < 10:  # Need minimum data points
             return None
 
-        # Get current and previous prices for momentum
-        current_price = price_history[-1]
-        prev_price = price_history[-2] if len(price_history) > 1 else current_price
-        price_momentum = current_price - prev_price
+        # Get current and previous prices for momentum (convert to float)
+        current_price = float(price_history[-1])
+        prev_price = (
+            float(price_history[-2]) if len(price_history) > 1 else current_price
+        )
+        price_momentum = float(current_price - prev_price)
 
         # Normalize price history
         mean_price = np.mean(price_history)
         std_price = np.std(price_history) if np.std(price_history) > 0 else 1
         normalized_price = (price_history - mean_price) / std_price
 
-        # Calculate first differences (momentum/velocity)
-        price_momentum_series = np.diff(normalized_price, prepend=normalized_price[0])
+        # Calculate first differences (momentum/velocity) manually to avoid concat issues
+        price_momentum_series = np.empty_like(normalized_price)
+        price_momentum_series[0] = 0.0
+        price_momentum_series[1:] = normalized_price[1:] - normalized_price[:-1]
 
         # TIME-DEPENDENT KINETIC TERM
         # The kinetic energy operator changes based on recent price momentum
-        kinetic_term = np.zeros((lookback, lookback))
-        momentum_factor = abs(price_momentum) / (std_price + 1e-10)
-
-        # Enhanced kinetic term with time-dependence
+        kinetic_term = np.zeros((lookback, lookback), dtype=float)
+        # Ensure momentum_factor is scalar
+        momentum_factor = float(abs(price_momentum) / (std_price + 1e-10))
+        # Build kinetic term: scalar k_factor at each position
+        base_k = float(self.params["kinetic_factor"])
+        trend = float(self.market_trend)
         for i in range(1, lookback - 1):
-            # Momentum weights the neighboring interactions
-            k_factor = self.params["kinetic_factor"] * (1 + 0.5 * momentum_factor)
-            kinetic_term[i, i - 1] = k_factor
-            kinetic_term[i, i] = -2 * k_factor
-            kinetic_term[i, i + 1] = k_factor
-
-        kinetic_term[0, 0] = -2 * self.params["kinetic_factor"]
-        kinetic_term[0, 1] = self.params["kinetic_factor"]
-        kinetic_term[-1, -2] = self.params["kinetic_factor"]
-        kinetic_term[-1, -1] = -2 * self.params["kinetic_factor"]
+            kf = base_k * (1 + 0.5 * momentum_factor + trend)
+            kinetic_term[i, i - 1] = kf
+            kinetic_term[i, i] = -2.0 * kf
+            kinetic_term[i, i + 1] = kf
+        # Edges with same base factor
+        kinetic_term[0, 0] = -2.0 * base_k
+        kinetic_term[0, 1] = base_k
+        kinetic_term[-1, -2] = base_k
+        kinetic_term[-1, -1] = -2.0 * base_k
 
         # TIME-DEPENDENT POTENTIAL TERM
         # Dynamic potential wells that evolve with market conditions
@@ -288,7 +325,10 @@ class EigenvalueAnalyzer:
                 well_contribution += well_effect
 
             # Final potential combines base and wells (wells reduce potential)
-            potential_term[i, i] = max(0.01, base_potential - well_contribution)
+            val = max(0.01, base_potential - well_contribution)
+            # add market trend influence to potential
+            val += self.market_trend * self.params.get("market_influence_factor", 0)
+            potential_term[i, i] = val
 
         # Complete time-dependent Hamiltonian
         hamiltonian = -kinetic_term + potential_term
@@ -390,8 +430,30 @@ class EigenvalueAnalyzer:
     def _calculate_eigenvalues(self, hamiltonian, price_history):
         """Calculate eigenvalues from Hamiltonian and map them to price space"""
         try:
-            # Calculate eigenvalues and eigenvectors
-            eigenvalues, eigenvectors = linalg.eigh(hamiltonian)
+            # Determine dimension and count
+            dim = hamiltonian.shape[0]
+            n = min(self.params["eigenvalue_count"], dim)
+            # Use sparse ARPACK solver for larger matrices
+            if dim > 50:
+                H_sparse = csr_matrix(hamiltonian)
+                raw_vals, raw_vecs = eigsh(
+                    H_sparse,
+                    k=n,
+                    which="SM",
+                    tol=self.params["eigen_solver_tol"],
+                    maxiter=self.params["eigen_solver_maxiter"],
+                )
+                # sort smallest eigenvalues
+                idx = np.argsort(raw_vals)
+                eigenvalues = raw_vals[idx]
+                eigenvectors = raw_vecs[:, idx]
+            else:
+                # dense solver for small matrices
+                eigenvalues, eigenvectors = linalg.eigh(hamiltonian)
+                # select lowest n
+                indices = np.linspace(0, len(eigenvalues) - 1, n).astype(int)
+                eigenvalues = eigenvalues[indices]
+                eigenvectors = eigenvectors[:, indices]
 
             # Get price statistics
             mean_price = np.mean(price_history)
@@ -403,12 +465,21 @@ class EigenvalueAnalyzer:
             # Calculate potential wells as price levels
             well_prices = [well["center"] for well in self.potential_wells]
 
-            # Select eigenvalues to track
-            n = min(self.params["eigenvalue_count"], len(eigenvalues))
-
-            # Get evenly spaced eigenvalues from the spectrum
-            indices = np.linspace(0, len(eigenvalues) - 1, n).astype(int)
-            raw_eigenvalues = eigenvalues[indices]
+            # Optionally refine each eigenvalue via Rayleigh quotient iteration
+            raw_vals = eigenvalues.copy()
+            if self.params.get("eigen_refinement_iters", 0) > 0:
+                for j in range(len(raw_vals)):
+                    lam = raw_vals[j]
+                    v = eigenvectors[:, j]
+                    for _ in range(self.params["eigen_refinement_iters"]):
+                        try:
+                            w = np.linalg.solve(hamiltonian - lam * np.eye(dim), v)
+                            v = w / np.linalg.norm(w)
+                            lam = float(v.T.dot(hamiltonian.dot(v)))
+                        except Exception:
+                            break
+                    raw_vals[j] = lam
+            raw_eigenvalues = raw_vals
 
             # Initialize time evolution operator (identity at start)
             if self.time_evolution_matrix is None:
@@ -629,3 +700,24 @@ class EigenvalueAnalyzer:
 
         distances = [abs(price - ev) for ev in eigenvalues]
         return min(distances)
+
+    # New method: calculate annualized Sharpe ratio from daily close prices
+    def _calculate_sharpe_ratio(self, price_history, lookback=252):
+        """Calculate annualized Sharpe ratio over specified lookback window"""
+        returns = np.diff(price_history) / price_history[:-1]
+        if len(returns) == 0:
+            return 0.0
+        window = returns[-lookback:] if len(returns) >= lookback else returns
+        mean_ret = np.mean(window)
+        std_ret = np.std(window)
+        if std_ret == 0:
+            return 0.0
+        # Annualize assuming 252 trading days
+        return float((mean_ret / std_ret) * np.sqrt(252))
+
+    # New method: calculate maximum drawdown
+    def _calculate_max_drawdown(self, price_history):
+        """Calculate maximum drawdown over entire price history"""
+        cum_max = np.maximum.accumulate(price_history)
+        drawdowns = (price_history - cum_max) / cum_max
+        return float(np.min(drawdowns))
