@@ -304,5 +304,5 @@ The calculated eigenvalues $E_n$ are then mapped back to the price domain and us
 2. Principles of Quantum Mechanics, R. Shankar
 3. Path Integrals in Quantum Mechanics, Jean Zinn-Justin
 4. Quantum Physics for Beginners, Z. Schechter
-5. Quantum Trading, Fabio Oreste
+5. Quantum Trading, Fabio Oreste ( My goat)
 6. Market Microstructure Theory, M. O'Hara
